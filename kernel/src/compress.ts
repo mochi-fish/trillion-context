@@ -42,6 +42,7 @@ import { projectUnit, collectCoverage } from "./unit-projection.js";
 import {
   appendMediaRefsSection,
   collectFoldMediaRefs,
+  mediaFoldOptions,
   parseMediaRefsSection,
 } from "./media-refs.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
@@ -1226,7 +1227,7 @@ const assignRefsNode: PipelineNode = {
     // like text and stay citable by their numeric ref for
     // decompress({ imageRef }) (#2607).
     const protectedFn = (m: CoreMessage) =>
-      hasUnrecoverableMediaPayload(m) ||
+      hasUnrecoverableMediaPayload(m, mediaFoldOptions(ctx.config)) ||
       (hasProtection
         ? (pathProtectedCallIds
             ? isMessageProtectedWithPairing(
@@ -1587,14 +1588,26 @@ const emergencyTruncateNode: PipelineNode = {
         return { ...m, text: clipped };
       });
     }
-    if (usage < ctx.config.truncate.threshold) {
+    // fork (companion lane, truncate.requireUsageSample): an estimate-grade
+    // reading is not evidence the watermark was crossed — after an aborted
+    // send it runs 1.5–1.9x the billed size. Hold fresh cuts until a billed
+    // reading lands; replay the latch exactly like the under-watermark path,
+    // and keep (not reset, not advance) the terminal streak. Off = upstream.
+    const estimateHold =
+      (ctx.config.truncate.requireUsageSample === true &&
+        ctx.tokenCountSource === "estimate") ||
+      // fork (R4): the host holds fresh cuts for the first turns after a
+      // model/route switch (stale reading). Same hold, same replay.
+      ctx.config.truncate.holdFreshCuts === true;
+    const underWatermark = usage < ctx.config.truncate.threshold;
+    if (underWatermark || estimateHold) {
       if (storedLatch.length === 0 && prevStreak === 0) return io;
       return {
         ...io,
         messages,
         state: {
           ...io.state,
-          terminalStreak: 0,
+          terminalStreak: underWatermark ? 0 : prevStreak,
           emergencyTruncateLatch:
             latchLive.length > 0 ? latchLive : undefined,
         },

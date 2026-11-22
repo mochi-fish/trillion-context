@@ -34,6 +34,7 @@ import {
   lastUserAnchor,
 } from "./protected.js";
 import { countMessageTokens } from "./tokenize.js";
+import { mediaFoldOptions } from "./media-refs.js";
 import { computeIntegrityWithdrawals } from "./turn-integrity.js";
 import { evaluateRefold } from "./refold.js";
 import { segmentGroups } from "./segment.js";
@@ -358,7 +359,7 @@ export function buildCompressibleRanges(
     // behind it (#1188/#2609): never advertised as compressible, and a gap
     // so no range spans it. Archivable inline images are compressible like
     // text (#2607).
-    if (hasUnrecoverableMediaPayload(msg)) {
+    if (hasUnrecoverableMediaPayload(msg, mediaFoldOptions(config))) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
       continue;

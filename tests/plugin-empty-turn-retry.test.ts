@@ -94,16 +94,33 @@ function anthropicEchoOnlyTurn(): string[] {
     ];
 }
 
-function anthropicProseTurn(text: string): string[] {
+function anthropicProseTurn(text: string, stopReason = "end_turn"): string[] {
     return [
         sse("message_start", { type: "message_start", message: { id: "msg_2", role: "assistant", usage: { input_tokens: 40 } } }),
         sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
         sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }),
         sse("content_block_stop", { type: "content_block_stop", index: 0 }),
-        sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 9 } }),
+        sse("message_delta", { type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 9 } }),
         sse("message_stop", { type: "message_stop" }),
     ];
 }
+
+test("only an Anthropic refusal from the identified response logs its request ID", async () => {
+    const refusal = anthropicProseTurn("fixture response body", "refusal");
+    for (const [first, retry, expected] of [
+        [refusal, undefined, ["[plugin] Anthropic stop_reason=refusal request-id=req_fixture"]],
+        [anthropicProseTurn("ordinary reply"), undefined, []],
+        [anthropicEchoOnlyTurn(), refusal, []],
+    ] as const) {
+        const logs: string[] = [];
+        const output: string[] = [];
+        await pipePluginChatWithStrip(streamOf(first), makeRes(output), "anthropic", makeSession(),
+            (message) => logs.push(message), retry ? async () => streamOf(retry) : undefined,
+            "https://api.anthropic.com", undefined, undefined, { requestId: "req_fixture" });
+        assert.deepEqual(logs.filter(message => message.includes("request-id=")), expected);
+        if (first === refusal || retry) assert.match(output.join(""), /"stop_reason":"refusal"/);
+    }
+});
 
 function textDeltas(raw: string, protocol: "openai" | "anthropic"): string {
     const re =

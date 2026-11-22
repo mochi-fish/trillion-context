@@ -124,6 +124,17 @@ export interface SessionRow {
     orphansJson?: string | null;
 }
 
+/** fork search v2 (11-20): a raw stored row as the search corpus reads it. */
+export interface SearchRow {
+    seq: number;
+    refNum: number | null;
+    role: string;
+    kind: string;
+    retired: boolean;
+    /** Serialized message (media payloads left split out). */
+    content: string;
+}
+
 export interface MessageRow {
     seq: number;
     msgId: string;
@@ -3162,6 +3173,44 @@ export class UnifiedStore {
             content: this.hydrateMedia(this.getContent(r.content_hash as string) ?? ""),
             };
         });
+    }
+
+    /** fork search v2 (11-20): one bounded page of message rows for the
+     *  search corpus — retired rows INCLUDED (flagged), media NOT hydrated
+     *  (the corpus never indexes image bytes), ordered by seq. Read-only. */
+    searchRowsPage(sessionId: string, afterSeq: number, limit: number, skipKinds: readonly string[] = []): SearchRow[] {
+        // One joined read per page (no per-row content lookup). Rows of a
+        // skipped kind still come back (seq / ref bookkeeping) but without
+        // their bytes — e.g. reasoning while the corpus leaves it out.
+        const kinds = skipKinds.filter((k) => /^[a-z-]+$/.test(k));
+        const skip = kinds.length > 0 ? `CASE WHEN m.kind IN (${kinds.map(() => "?").join(",")}) THEN NULL ELSE c.bytes END` : "c.bytes";
+        const rows = this.db
+            .prepare(`SELECT m.seq, m.ref_num, m.role, m.kind, m.retired_at, ${skip} AS bytes FROM messages m LEFT JOIN content c ON c.hash = m.content_hash WHERE m.session_id = ? AND m.seq > ? ORDER BY m.seq LIMIT ?`)
+            .all(...kinds, sessionId, afterSeq, Math.max(1, Math.floor(limit))) as Record<string, unknown>[];
+        return rows.map((r) => ({
+            seq: r.seq as number,
+            refNum: (r.ref_num as number | null) ?? null,
+            role: r.role as string,
+            kind: r.kind as string,
+            retired: r.retired_at !== null && r.retired_at !== undefined,
+            content: r.bytes ? Buffer.from(r.bytes as Uint8Array).toString("utf8") : "",
+        }));
+    }
+
+    /** fork search v2 (11-20): message rows whose ref_num lies in [lo, hi]
+     *  (retired included, media not hydrated) — the `around` reader. */
+    searchRowsByRefRange(sessionId: string, lo: number, hi: number): SearchRow[] {
+        const rows = this.db
+            .prepare("SELECT seq, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ? AND ref_num BETWEEN ? AND ? ORDER BY seq")
+            .all(sessionId, lo, hi) as Record<string, unknown>[];
+        return rows.map((r) => ({
+            seq: r.seq as number,
+            refNum: (r.ref_num as number | null) ?? null,
+            role: r.role as string,
+            kind: r.kind as string,
+            retired: r.retired_at !== null && r.retired_at !== undefined,
+            content: this.getContent(r.content_hash as string) ?? "",
+        }));
     }
 
     /** #4739: live message rows for EXACTLY the given seqs — the bounded

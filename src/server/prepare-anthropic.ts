@@ -1,7 +1,9 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
+import { fishOccRecordOn } from "../fish/date-notes.js";
+import { fishOccRecordTurn } from "../fish/store-readers.js";
 import { renderNudgeText, viableRanges } from "acp-kernel";
-import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
+import { anthropicToCore, buildSystem, coreToAnthropic, extractSystem, insertBeforeTrailingSystemRun, type AnthropicRequestBody, type BiliMessage } from "acp-kernel/wire";
 import { rewriteInboundThreadContinue } from "./thread-tracking.js";
 import { captureThreadsTurn, estimateThreadsTokens, isThreadsBody, threadsReforgeEnabled } from "./threads-lane.js";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -10,7 +12,8 @@ import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, dedupeAdjacentOutputConfig, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, makeFoldPointReasoningDroppable, planReasoningDrop, reapOrphansLogged, runNudgeDecision, stripKernelSummaries, warnAnthropicThinkingPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode, epochMajorityGuardOn } from "../fold-reconcile.js";
+import { noteTruncateHeld, truncateHeldLine, truncateHeldThisTurn } from "../truncate-hold.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -44,6 +47,7 @@ import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStam
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { yieldToEventLoop } from "../yield-loop.js";
+import { collectAnthropicFileIds, replaceForeignFileImages } from "../host-file-images.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -75,6 +79,12 @@ export async function prepareAnthropic(
     delete (parsed as Record<string, unknown>)[MSG_IDS_BODY_FIELD];
     const incomingMsgSeqs = (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
     delete (parsed as Record<string, unknown>)[MSG_SEQS_BODY_FIELD];
+    // fork: compress.foldHostFileImages — snapshot THIS request's inbound
+    // file-sourced image ids before anything rebuilds the history; the egress
+    // gate below lets only these reach the upstream (see host-file-images.ts).
+    const inboundFileIds = (config as { foldHostFileImages?: boolean }).foldHostFileImages === true
+        ? collectAnthropicFileIds(parsed.messages)
+        : undefined;
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
     // #3417: lane decisions (profile + per-wire observation) own the
@@ -168,6 +178,7 @@ export async function prepareAnthropic(
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltMessages = parsed.messages;
+    const tailNotes: { role: "user"; content: string }[] = [];
     let anthropicCacheMarks: Map<string, { type: "ephemeral" }> | undefined;
     let clientCacheControls: Map<string, unknown> | undefined;
     let systemOut = parsed.system;
@@ -346,7 +357,7 @@ export async function prepareAnthropic(
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId), majorityGuard: epochMajorityGuardOn(config) });
         noteSystemPromptFingerprint(session, clientSystem, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -364,6 +375,10 @@ export async function prepareAnthropic(
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        // fork: requireUsageSampleForTruncate — the kernel held a cut on an estimate reading; count it, say it once per turn.
+        if (truncateHeldThisTurn(loopConfig, tokenCount, tokenCountSource)) log("info", truncateHeldLine(sessionId, tokenCount, loopConfig.modelContextLimit, noteTruncateHeld(session, tokenCount, loopConfig.modelContextLimit)));
+        // fork（日期，D4）：fish.dateNotes.recordOccurrence 开着时记 A 档（session_ext 的 fish:occ:*）；关着时什么都不做
+        if (fishOccRecordOn()) fishOccRecordTurn(session.id, session.state, turn.state, renderMsgs);
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -485,9 +500,16 @@ export async function prepareAnthropic(
         // stay in session state/persistence untouched.
         const egressMessages = await applyImageRescalePass(processedMessages as BiliMessage[], { session, sessionId, log, maxDim: imageRescaleMaxDim(), toolArmed: imageRescaleToolArmed(session) });
         rebuiltMessages = coreToAnthropic(egressMessages, anthropicCacheMarks ?? cacheControls);
-        if (sysNotes.length > 0) {
-            rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
+        if (inboundFileIds !== undefined) {
+            const gated = replaceForeignFileImages(rebuiltMessages, inboundFileIds);
+            if (gated.replaced > 0) {
+                rebuiltMessages = gated.messages;
+                const prior = typeof session.metadata.hostFileImagesReplaced === "number" ? session.metadata.hostFileImagesReplaced : 0;
+                session.metadata.hostFileImagesReplaced = prior + gated.replaced;
+                log("warn", `[${sessionId}] [host-file-images] ${gated.replaced} outbound file-sourced image(s) carried a file id this request did not send — replaced with a placeholder (only the host's current upload may reach the upstream)`);
+            }
         }
+        tailNotes.push(...sysNotes.map((content) => ({ role: "user" as const, content })));
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
@@ -520,7 +542,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        tailNotes.push({ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -532,14 +554,15 @@ export async function prepareAnthropic(
                 const ranges = turn.nudge.compressibleRanges ?? [];
                 // [#5688] the side call shares the main request's upstream —
                 // un-deduped rebuiltMessages would 400 the decision too.
-                const sideBody: Record<string, unknown> = { ...parsed, messages: [...dedupeAdjacentOutputConfig(rebuiltMessages), { role: "user", content: buildDecisionPrompt(ranges) }], system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
+                const sideMessages = insertBeforeTrailingSystemRun(rebuiltMessages, [...tailNotes, { role: "user", content: buildDecisionPrompt(ranges) }]);
+                const sideBody: Record<string, unknown> = { ...parsed, messages: dedupeAdjacentOutputConfig(sideMessages), system: systemOut, tools: toolsOut, stream: false, max_tokens: decide.maxTokens };
                 delete sideBody.prompt_cache_key;
                 stripDecisionReasoningFields("anthropic", sideBody);
                 const outcome = await runNudgeDecision({ req, opts, protocol: "anthropic", sideBody, session, log });
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        tailNotes.push({ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -555,7 +578,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        tailNotes.push({ role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -575,7 +598,7 @@ export async function prepareAnthropic(
         // carrier as the nudge (never persisted, never in the client's
         // re-sent history, prefix-cache safe).
         if (turn.statusLine) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: turn.statusLine }];
+            tailNotes.push({ role: "user", content: turn.statusLine });
         }
         // [#1343/#1457] surface any earlier undelivered retrieve as an ephemeral
         // trailing user note (kept last so it never reorders cached messages).
@@ -584,7 +607,7 @@ export async function prepareAnthropic(
         const retrNotes = snapshotRetrievalNotes(session);
         const retrNote = renderRetrievalNotes(retrNotes);
         if (retrNote) {
-            rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
+            tailNotes.push({ role: "user", content: retrNote });
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
@@ -603,8 +626,10 @@ export async function prepareAnthropic(
     // ({role:"system", content:[], output_config}) adjacent — OpenRouter rejects
     // that shape with a hard 400 on every retry. Collapse to the latter before
     // egress; the helper returns the input array unchanged on the clean path.
-    const dedupedMessages = dedupeAdjacentOutputConfig(rebuiltMessages);
-    if (dedupedMessages !== rebuiltMessages) {
+    // A contentful system tail must remain last, including when several proxy notes ride together.
+    const withNotes = insertBeforeTrailingSystemRun(rebuiltMessages, tailNotes);
+    const dedupedMessages = dedupeAdjacentOutputConfig(withNotes);
+    if (dedupedMessages !== withNotes) {
         log("warn", `[${sessionId}] adjacent-output-config: collapsed duplicate effort directive(s) after fold reconstruction (#5688)`);
     }
     warnAnthropicThinkingPairs(parsed.messages, dedupedMessages, log, sessionId);

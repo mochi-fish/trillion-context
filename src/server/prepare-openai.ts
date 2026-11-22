@@ -1,5 +1,7 @@
 import http from "node:http";
 import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, Prompts } from "acp-kernel";
+import { fishOccRecordOn } from "../fish/date-notes.js";
+import { fishOccRecordTurn } from "../fish/store-readers.js";
 import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
@@ -11,9 +13,11 @@ import { MSG_IDS_BODY_FIELD, applyMsgIdPin, validateMsgIds } from "../msgid-pin.
 import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, makeFoldPointReasoningDroppable, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { yieldToEventLoop } from "../yield-loop.js";
+import { openaiReasoningAliasesOf } from "../model-windows.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode, epochMajorityGuardOn } from "../fold-reconcile.js";
+import { noteTruncateHeld, truncateHeldLine, truncateHeldThisTurn } from "../truncate-hold.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor, storedRowLookupFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -128,7 +132,11 @@ export async function prepareOpenai(
     let wpOutcome: FastpathOutcome | null = null;
     let wpFullText: string | undefined;
     const wpModel = typeof parsed.model === "string" ? parsed.model : "";
-    if (bodyText !== undefined && pluginMode && !isTitleGen && featureEnabled("pluginFullResendWatermark")) {
+    // fork (M8): the session reads vLLM's `reasoning` (and `reasoning_text`) as
+    // reasoning_content. The watermark fastpath decodes its fragments without
+    // the alias, so an alias session always takes the legacy full path.
+    const reasoningAliases = openaiReasoningAliasesOf(config);
+    if (bodyText !== undefined && pluginMode && !isTitleGen && reasoningAliases === undefined && featureEnabled("pluginFullResendWatermark")) {
         wpFullText = bodyText;
         wpOutcome = evaluateWatermarkFastpath(bodyText, req, session, { pluginMode, titleGen: isTitleGen, model: wpModel }, log);
         log("debug", `[${session.id}] fastpath ${wpOutcome.hit ? "HIT" : wpOutcome.decision}${wpOutcome.creditedMiss ? "(credited)" : ""}${wpOutcome.measuredT !== undefined ? ` T=${wpOutcome.measuredT}` : ""}`);
@@ -159,7 +167,7 @@ export async function prepareOpenai(
         // OUT of the fold space: system content is host runtime state and
         // must not feed ids/fingerprints. Capture it and re-inject below —
         // otherwise the proxy would forward payloads without any system.
-        const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : openaiToCore(parsed);
+        const converted = wpHit !== undefined ? { msgs: wpHit.view, systemText: wpHit.systemText } : reasoningAliases !== undefined ? openaiToCore(parsed, { reasoningAliases }) : openaiToCore(parsed);
         let msgs = converted.msgs;
         let systemText = converted.systemText;
         openaiSystemText = systemText;
@@ -302,7 +310,7 @@ export async function prepareOpenai(
         // #3301: stored decompositions for pre-#2644 anchors whose wire-side
         // backfill can never fire after a wire-shape flip.
         const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
-        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId) });
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs), storedRowLookup: foldMode === "off" ? undefined : storedRowLookupFor(sessionId), majorityGuard: epochMajorityGuardOn(config) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -320,6 +328,10 @@ export async function prepareOpenai(
         // #5293: re-anchor the nudge growth reference after a user-aborted turn (no-op otherwise).
         absorbAbortedTurnGrowth(session, tokenCount);
         const turn = core.processTurn({ messages: renderMsgs, state: session.state, config: loopConfig, tokenCount, tokenCountSource, renderTags: renderStrategy, contentStore: contentStoreOf(session) });
+        // fork: requireUsageSampleForTruncate — the kernel held a cut on an estimate reading; count it, say it once per turn.
+        if (truncateHeldThisTurn(loopConfig, tokenCount, tokenCountSource)) log("info", truncateHeldLine(sessionId, tokenCount, loopConfig.modelContextLimit, noteTruncateHeld(session, tokenCount, loopConfig.modelContextLimit)));
+        // fork（日期，D4）：fish.dateNotes.recordOccurrence 开着时记 A 档（session_ext 的 fish:occ:*）；关着时什么都不做
+        if (fishOccRecordOn()) fishOccRecordTurn(session.id, session.state, turn.state, renderMsgs);
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // #4528: split the kernel pass from its post-processing scan passes so
@@ -641,7 +653,7 @@ export async function prepareOpenai(
         });
         if (Object.keys(wpResponseHeaders).length === 0) wpResponseHeaders = undefined;
     }
-    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), parsedBody: rebuilt, session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, responseExtraHeaders: wpResponseHeaders, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId), ...(reasoningAliases !== undefined ? { openaiReasoningAliases: reasoningAliases } : {}) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

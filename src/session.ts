@@ -5,7 +5,7 @@ import { getStore, effectiveFileStorageMode } from "./persist.js";
 import { VERSION } from "./version.js";
 import { maxSessions as knobMaxSessions, sessionWarmMax, sessionWarmMaxBytes, sessionResidentMaxBytes } from "./knobs.js";
 import { configFileEpoch, loadConfigFile } from "./config.js";
-import { applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { applyCompressSettings, applySessionCompressOverride, hasCompressSettings, resolveContextLimitValue, resolveSessionCompressOverride } from "./compress-settings.js";
 import { durableMessageToolPaths, withDurableProtection } from "./durable-message-guards.js";
 import type { AnonymousProvenance } from "./anon-provenance.js";
 import type { WireProtocol } from "./util.js";
@@ -805,11 +805,15 @@ function staleEffectiveStamp(session: Session | undefined): boolean {
  *  knob between the edit and the session's next wire request. Provider/model
  *  cascade levels need the request URL and are deliberately NOT re-resolved
  *  here — the next wire request re-stamps the full cascade. */
-function liveFileOverlayConfig(base: Config): Config {
+function liveFileOverlayConfig(base: Config, sessionId?: string): Config {
     const compress = loadConfigFile().compress;
     if (!compress || !hasCompressSettings(compress)) return base;
     const limit = resolveContextLimitValue(compress.modelContextLimit, base.modelContextLimit);
-    return applyCompressSettings(base, limit, compress, {});
+    // fork: the per-session override (compress.sessions) is global-tier file
+    // state too — re-apply it so a config edit between wire requests never
+    // serves this session the plain global value.
+    const sessionOverride = resolveSessionCompressOverride(compress, [sessionId]);
+    return applySessionCompressOverride(applyCompressSettings(base, limit, compress, {}), sessionOverride?.override, base.modelContextLimit);
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
@@ -820,7 +824,7 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // user-disabled summary chain for days off one such stamp. Refuse the
     // snapshot and resolve the live file tier onto the fallback instead.
     if (staleEffectiveStamp(session)) {
-        const live = liveFileOverlayConfig(fallback);
+        const live = liveFileOverlayConfig(fallback, session?.id);
         const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
         const classifier = lane ? durableMessageToolPaths[lane] : undefined;
         return classifier && !live.messagePathOf ? withDurableProtection(live, classifier) : live;

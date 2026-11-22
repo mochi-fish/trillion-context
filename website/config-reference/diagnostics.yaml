@@ -160,3 +160,51 @@ entries:
     desc_zh: "会话内临时展开内容的大小上限（按块计）。"
     site_en: "<code>decompressTmpCap</code> — size cap for temporary decompressed blocks (default 50)."
     site_zh: "<code>decompressTmpCap</code> —— 临时展开块的大小上限（默认 50）。"
+  - key: fishLedger.recordEstimate
+    type: boolean
+    default: "false (unset)"
+    group: diagnostics
+    desc_en: "Fork (multi-model): when true and the fish-ledger proxy writer is open, each usage row of the provider layer carries data.est — counts only: the request's local text estimate, outbound image count and image tokens, the text-side estimate (messages plus wire overhead) and the k̂ in effect before this settlement — for offline fitting of an additive per-model calibration. Nothing else changes. Takes effect at once on POST /__bili/config/reload and on a settings-page save (PUT /__bili/config). False/unset = no extra key."
+    desc_zh: "fork（多模型）：开着而且证据账（fish-ledger）的代理写入方开着时，provider 那一层的每条 usage 行多带一个 data.est——只有数：这份请求的本地文字估计、外发图的张数和图的 token、文字侧估计（消息加线上开销）、这次结算之前的 k̂——给离线拟合按模型的加性校准用。别的都不变。POST /__bili/config/reload 或设置页保存（PUT /__bili/config）后当场生效。false / 不写 = 不多这个键。"
+  - key: fish.dateNotes.enabled
+    type: boolean
+    default: "false (unset)"
+    group: diagnostics
+    desc_en: "Fork (dates): when true, tool results that read old conversation — search_context excerpts and around (cjk engine), whole-block decompress (inline, temp file, toFile) — get a computed date note after relative date words (\"下周三（=2026-11-25 周三）\"), each message using the moment it was really said (occurrence side table, then the kernel's first-seen stamps clamped into intervals). Only conversation is noted (never reasoning, tool output, web pages, or chat logs fetched by a tool); quoted, reported, hypothetical and 0–5 a.m. \"tomorrow\" are skipped; a result with a note ends (or a file starts) with one legend line. Never touches the kernel render, stored messages or anything sent upstream. Rules live in src/fish/reldate.mjs, a byte copy checked by sha256 at load — mismatch keeps the feature off. False/unset = results byte-identical to a build without it. Takes effect on POST /__bili/config/reload or a settings-page save. Any unknown key or bad value in the fish block switches the whole block off (one warn line)."
+    desc_zh: "fork（日期）：开着时，翻旧话的工具结果——search_context 的摘录和 around（cjk 引擎）、整块 decompress（inline、临时文件、toFile）——在相对日期的说法后面补一个算好的日期（「下周三（=2026-11-25 周三）」），每条原话按它真正说出的那一刻算（先查发生时刻旁路表，再用内核第一次看到的时刻夹出区间）。只标对话（不标思考、工具回执、网页、工具翻出来的聊天记录）；引号里的、转述的、假设的、0–5 点说的「明天」不标；有注记的结果结尾（文件是开头）多一行图例。不碰内核渲染、存下的消息和发给上游的任何东西。规则在 src/fish/reldate.mjs（逐字节拷贝，载入时核 sha256，对不上整条不启用）。false / 不写 = 工具结果和没有这一项时逐字节一样。POST /__bili/config/reload 或设置页保存后生效。fish 块里有一个认不出的键或不对的值，整块当没写（全关，记一行 warn）。"
+  - key: fish.dateNotes.summaries
+    type: boolean
+    default: "false"
+    group: diagnostics
+    desc_en: "Fork (dates): also note relative dates inside her own block summaries shown by search_context, anchored to the time span the block covers (no note when that span crosses a day). Off by default: a summary may be written days after the talk."
+    desc_zh: "fork（日期）：search_context 列出的她自己写的块摘要也标，锚点是这一块覆盖的那段时间（跨日不标）。缺省关：摘要可能是几天后才写的。"
+  - key: fish.dateNotes.tzOffsetMin
+    type: number
+    default: "540"
+    group: diagnostics
+    desc_en: "Fork (dates): fixed local offset in minutes used for every date note and occurrence month key (never the process time zone). Integer −720…840."
+    desc_zh: "fork（日期）：日期注记和发生时刻月份键用的固定当地偏移（分钟，不看进程时区）。整数 −720…840。"
+  - key: fish.dateNotes.nightEndHour
+    type: number
+    default: "5"
+    group: diagnostics
+    desc_en: "Fork (dates): words said between 0:00 and this hour that hinge on the day (\"明天\", \"下周一\" on a Monday night) get no note. Integer 0…12."
+    desc_zh: "fork（日期）：0 点到这个钟点之间说的、要看「今天算哪天」的词（「明天」、周一夜里的「下周一」）不标。整数 0…12。"
+  - key: fish.dateNotes.maxPerResult
+    type: number
+    default: "24"
+    group: diagnostics
+    desc_en: "Fork (dates): at most this many notes in one tool result. Integer 1…200."
+    desc_zh: "fork（日期）：一个工具结果里最多标几处。整数 1…200。"
+  - key: fish.dateNotes.maxPerSnippet
+    type: number
+    default: "3"
+    group: diagnostics
+    desc_en: "Fork (dates): at most this many notes in one search_context excerpt (with its reply line). Integer 1…24."
+    desc_zh: "fork（日期）：search_context 的一段摘录（连同后面那句回话）里最多标几处。整数 1…24。"
+  - key: fish.dateNotes.recordOccurrence
+    type: boolean
+    default: "false"
+    group: diagnostics
+    desc_en: "Fork (dates): record when each new message really happened into session_ext keys fish:occ:YYYYMM (local month) — incoming messages at their first-seen stamp, the previous reply at the moment its usage settled; a turn with 17+ newly stamped messages or a reply not at the front records nothing. Read back as the most trusted anchor for date notes. False/unset = not one fish:occ:* key is written."
+    desc_zh: "fork（日期）：把每条新消息真正发生的时刻记进 session_ext 的 fish:occ:YYYYMM（当地月）——进来的话记第一次看到的时刻，上一段回复记它的用量结算那一刻；一轮新盖章 17 条以上、或回复不在最前面，整轮不记。日期注记读它当最可信的锚点。false / 不写 = 一个 fish:occ:* 键都不写。"

@@ -20,6 +20,7 @@ import {
   lastUserAnchor,
 } from "./protected.js";
 import type { LatestProtected } from "./protected.js";
+import { mediaFoldOptions } from "./media-refs.js";
 import {
   buildIntegrityPre,
   computeIntegrityWithdrawals,
@@ -267,7 +268,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
 
   const mediaExcluded = directMessageIds.filter((id) => {
     const msg = msgById(id);
-    return !!msg && hasUnrecoverableMediaPayload(msg);
+    return !!msg && hasUnrecoverableMediaPayload(msg, mediaFoldOptions(input.config));
   });
   if (mediaExcluded.length > 0) {
     warnings.push(
@@ -840,7 +841,7 @@ function filterProtectedToolMessages(
     const msg = lookupMsg(id);
     if (!msg) continue;
     if (
-      hasUnrecoverableMediaPayload(msg) ||
+      hasUnrecoverableMediaPayload(msg, mediaFoldOptions(config)) ||
       (isMessageProtected(msg, config, failedCompressCallIds) &&
         !isExemptFold(msg)) ||
       isMessageLatestProtected(msg, latest)

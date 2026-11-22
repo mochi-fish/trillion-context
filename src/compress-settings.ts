@@ -1,6 +1,6 @@
 import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, builtinSource, createDirPackSource, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type Pack, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
-import { findRoute, resolveModelEntryOnRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
+import { findRoute, resolveModelEntryOnRoute, sanitizeSessionCompressOverride, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes, type SessionCompressOverride } from "./config.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { expandExternalSummaryChainTolerant, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -81,6 +81,11 @@ export function mergeCompress(
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         requireNudge: pick("requireNudge"),
         requireRecommendation: pick("requireRecommendation"),
+        noGhostwrite: pick("noGhostwrite"),
+        foldHostFileImages: pick("foldHostFileImages"),
+        epochMajorityGuard: pick("epochMajorityGuard"),
+        requireUsageSampleForTruncate: pick("requireUsageSampleForTruncate"),
+        foldHostFileImagePaths: pick("foldHostFileImagePaths"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -137,6 +142,94 @@ export function resolveCompress(
     const route = findRoute(routes, upstreamUrl);
     return mergeCompress(global, route?.compress, resolveModelEntryOnRoute(route, model).entry?.compress);
 }
+
+const warnedSessionOverride = new Set<string>();
+
+/** fork: the per-session override for one request, looked up in the GLOBAL
+ *  compress block's `sessions` table (provider/model levels never carry it).
+ *  `identities` are tried in order — the proxy's bound session id first, then
+ *  the request's plugin conversation header — and merged FIELD BY FIELD: for
+ *  each field the first identity whose entry sets it wins (own-property
+ *  lookup only, so "__proto__"/"constructor" never match). So a derived
+ *  chain (`<sid>|aud:…`, `<sid>|sub:…`) that writes only its own window
+ *  still inherits noGhostwrite & co. from the conversation's entry instead
+ *  of silently dropping them. The raw file tier is NOT pre-validated
+ *  (loadOptions spreads the file block verbatim), so each entry is sanitized
+ *  here: bad fields are dropped with a one-time warn, and a matched entry with
+ *  no valid field contributes nothing. Returns undefined when nothing applies
+ *  — the caller then keeps the three-level result untouched. `key` is the
+ *  first contributing entry (for logs), `keys` every contributing entry. */
+export function resolveSessionCompressOverride(
+    globalCompress: CompressSettings | undefined,
+    identities: readonly (string | undefined)[],
+): { key: string; keys: string[]; override: SessionCompressOverride } | undefined {
+    const table = (globalCompress as { sessions?: unknown } | undefined)?.sessions;
+    if (!table || typeof table !== "object" || Array.isArray(table)) return undefined;
+    const merged: SessionCompressOverride = {};
+    const keys: string[] = [];
+    const seen = new Set<string>();
+    for (const id of identities) {
+        if (typeof id !== "string" || id.length === 0 || seen.has(id)) continue;
+        seen.add(id);
+        if (!Object.prototype.hasOwnProperty.call(table, id)) continue;
+        const { value, problems } = sanitizeSessionCompressOverride((table as Record<string, unknown>)[id]);
+        if (problems.length > 0) {
+            const sig = `${id}\u0000${problems.join("\u0000")}`;
+            if (!warnedSessionOverride.has(sig)) {
+                warnedSessionOverride.add(sig);
+                loggerLog("warn", `[compress] compress.sessions["${id}"]: ${problems.join("; ")} — ${value ? "the valid fields still apply" : "the entry is ignored"}`);
+            }
+        }
+        if (!value) continue;
+        let contributed = false;
+        for (const field of Object.keys(value) as (keyof SessionCompressOverride)[]) {
+            if (merged[field] !== undefined || value[field] === undefined) continue;
+            (merged as Record<string, unknown>)[field] = value[field];
+            contributed = true;
+        }
+        if (contributed) keys.push(id);
+    }
+    return keys.length > 0 ? { key: keys[0]!, keys, override: merged } : undefined;
+}
+
+/** fork: apply a per-session override on top of an already-resolved request
+ *  Config: modelContextLimit (`nativeWindow` is what a "70%" value is a
+ *  fraction of) and the boolean switches noGhostwrite / foldHostFileImages /
+ *  epochMajorityGuard / foldHostFileImagePaths (each wins over the three-level
+ *  value, either way), and requireUsageSampleForTruncate (lands on the
+ *  kernel's truncate block).
+ *  Returns the input object unchanged when the override carries nothing that
+ *  differs, so an unconfigured session stays identical. */
+export function applySessionCompressOverride<T extends Config>(config: T, override: SessionCompressOverride | undefined, nativeWindow: number): T {
+    if (override === undefined) return config;
+    let out = config;
+    if (override.modelContextLimit !== undefined) {
+        const limit = resolveContextLimitValue(override.modelContextLimit, nativeWindow);
+        if (limit !== out.modelContextLimit) out = { ...out, modelContextLimit: limit };
+    }
+    for (const key of ["noGhostwrite", "foldHostFileImages", "epochMajorityGuard", "foldHostFileImagePaths"] as const) {
+        const v = override[key];
+        if (v !== undefined && (out as Record<string, unknown>)[key] !== v) out = { ...out, [key]: v };
+    }
+    // fork（多模型）：M7 / M8 的按会话开关落到这一份请求的 Config 上（只在写了时才多这个键）。
+    for (const key of ["anthropicThinkingBinding", "openaiReasoningAliases"] as const) {
+        const v = override[key];
+        if (v !== undefined && (out as Record<string, unknown>)[key] !== v) out = { ...out, [key]: v };
+    }
+    // fork: emergency truncation waits for a billed reading (kernel
+    // truncate.requireUsageSample). Same either-way precedence as above.
+    const holdTruncate = override.requireUsageSampleForTruncate;
+    if (holdTruncate !== undefined && (out.truncate as TruncateWithUsageHold).requireUsageSample !== holdTruncate) {
+        out = { ...out, truncate: { ...out.truncate, requireUsageSample: holdTruncate } as TruncateWithUsageHold };
+    }
+    return out;
+}
+
+/** fork: the kernel truncate block with the companion-lane usage hold
+ *  (kernel TruncateConfig.requireUsageSample). Typed here so the host compiles
+ *  against a kernel that does not declare the field yet; such a kernel simply
+ *  ignores it (validateConfig does not flag unknown keys). */
+type TruncateWithUsageHold = Config["truncate"] & { requireUsageSample?: boolean };
 
 let warnedPromptsRisk = false;
 
@@ -297,7 +390,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
 // (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings };
+export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[]; externalSummary?: ExternalSummarySettings; noGhostwrite?: boolean; epochMajorityGuard?: boolean; foldHostFileImagePaths?: boolean };
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.
@@ -345,6 +438,10 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     // #5865 estimate-hold backstop bound — pass through like every numeric
     // knob (0 is meaningful: it disables the hold).
     if (s.maxEstimateHoldRounds !== undefined && typeof s.maxEstimateHoldRounds === "number") nudge.maxEstimateHoldRounds = Math.floor(s.maxEstimateHoldRounds);
+    // fork (companion lane): emergency truncation cuts only on a billed
+    // reading. Unset at every level leaves the key absent from the truncate
+    // block — upstream truncation, byte-identical.
+    if (s.requireUsageSampleForTruncate !== undefined) (truncate as TruncateWithUsageHold).requireUsageSample = s.requireUsageSampleForTruncate === true;
     if (s.tierNudgeTokens !== undefined) {
         const tg: NonNullable<Config["nudge"]["tierGrowthTokens"]> = {};
         if (typeof s.tierNudgeTokens.t1 === "number") tg.t1 = s.tierNudgeTokens.t1;
@@ -409,6 +506,22 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             s.compressAtFoldPointClearThinking,
         ),
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
+        // fork: no-ghostwrite rides the Config rail like externalSummary
+        // (host-only field; the kernel never reads it). Unset at every level
+        // leaves the key absent — the resolved object stays byte-identical.
+        ...(s.noGhostwrite !== undefined ? { noGhostwrite: s.noGhostwrite === true } : {}),
+        // fork: Anthropic file-sourced images foldable (kernel field, read by
+        // hasUnrecoverableMediaPayload via mediaFoldOptions). Unset at every
+        // level leaves the key absent — upstream pinning, byte-identical.
+        ...(s.foldHostFileImages !== undefined ? { foldHostFileImages: s.foldHostFileImages === true } : {}),
+        // fork: upstream #5737's surviving-majority guard, default off (host-only
+        // field read by fold-reconcile via epochMajorityGuardOn). Unset at every
+        // level leaves the key absent — 0.1.213's reconcile verdict, byte-identical.
+        ...(s.epochMajorityGuard !== undefined ? { epochMajorityGuard: s.epochMajorityGuard === true } : {}),
+        // fork: image-path footers for folded host file images (host-only field,
+        // read via hostImagePathsOn together with foldHostFileImages). Unset at
+        // every level leaves the key absent — byte-identical.
+        ...(s.foldHostFileImagePaths !== undefined ? { foldHostFileImagePaths: s.foldHostFileImagePaths === true } : {}),
     };
     return resolved;
 }

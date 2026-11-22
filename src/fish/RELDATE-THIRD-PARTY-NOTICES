@@ -1,0 +1,93 @@
+THIRD-PARTY-NOTICES — sessionless/reldate（reldate.mjs、anchor-from-row.mjs）
+
+本目录的代码是自己写的，没有拷贝下面任何一个项目的代码。设计时读过它们，借用的是思路和几段词表的起点
+（具体借了什么见 reldate.mjs 文件头和 research1119/plan-1119/dates.md 第六节）。三者都是 MIT 许可，
+按许可要求在此附上原文。没有读、也没有借任何 PolyForm 许可的仓库。
+
+1. dsh-dot-life 0.24.0 — src/memory/when.js
+   https://github.com/Kevinwu901113/dsh-dot（提交 a914665，2026-11-18）
+   借的思路：转述 / 假设词表的起点；「天(?![气空])」「一(?![直起下样…])」这类前后看；「后面紧跟具体日期就不标」。
+   不学的两处：用进程本地时间；「同年不写年份」（结果随「现在」变，不确定）。
+
+2. 灵枢 dsh-memory（@furongjun1999/dsh-memory 0.11.1）— md_cg/reldate.py
+   https://github.com/FuRongJun-1999/dsh-memory（提交 87bd1a0，2026-11-18）
+   借的思路：「N 天前 / 后」左边界不让数字粘连；范围上限；幂等的写法。
+
+3. dsh-rofm 1.5.9 — engine/relative-time.js
+   https://github.com/wall1234567/dsh-rofm（提交 2763348，2026-11-16）
+   只借了反例（把「去年12月」拆成两段、1970、退回 createdAt、UTC 日期），没有借代码。
+
+-------------------------------------------------------------------------------
+1. dsh-dot-life — LICENSE
+-------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 Kevinwu901113
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+2. dsh-memory（灵枢）— LICENSE
+-------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 FuRongJun-1999
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+3. dsh-rofm — LICENSE
+-------------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2026 dsh-rofm contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

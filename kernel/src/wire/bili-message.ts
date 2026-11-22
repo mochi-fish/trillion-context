@@ -82,6 +82,13 @@ export interface BiliMessage extends CoreMessage {
    *  this when it found no reasoning text to store; coreToOpenai re-emits
    *  the key (blank) instead of dropping it. */
   reasoningPresent?: boolean;
+  /** fork (multi-model, M8): OpenAI — the host carried this turn's reasoning
+   *  under an ALIAS field (vLLM >= 0.10 answers `reasoning`, some gateways
+   *  `reasoning_text`) instead of `reasoning_content`. Only set when the
+   *  caller passed openaiToCore({ reasoningAliases }); coreToOpenai then
+   *  re-emits the reasoning under this same field name, so the wire keeps
+   *  the host's spelling. Not part of the identity seed. */
+  reasoningField?: string;
   /** Anthropic tool_result.is_error. Marks the tool result as an error so
    *  the model knows the tool failed (not just returned an error string). */
   toolIsError?: boolean;

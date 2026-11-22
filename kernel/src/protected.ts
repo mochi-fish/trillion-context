@@ -1,6 +1,6 @@
 import type { Config, CoreMessage } from "./types.js";
 import { SUMMARY_HEADER } from "./prune.js";
-import { hasRefRecoverableMediaPayload } from "./media-refs.js";
+import { hasRefRecoverableMediaPayload, isHostHeldFileSource, type MediaFoldOptions } from "./media-refs.js";
 
 /** Tools that are ALWAYS protected, regardless of user config. These are ACP's
  *  own metadata tools whose records must remain in context: compress calls
@@ -617,8 +617,21 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
  *  data-URL test mirrors the host archive channel (image-restore.ts
  *  messageImageBytes) exactly, so "recoverable here" ⇔ "bytes actually
  *  spilled there". */
-export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
+export function hasUnrecoverableMediaPayload(msg: CoreMessage, opts?: MediaFoldOptions): boolean {
   const m = msg as CoreMessage & MediaSidecar;
+  // fork: Config.foldHostFileImages — an Anthropic {type:"file"} image source
+  // the host holds counts as foldable (pixels leave the view, no handle is
+  // recorded, decompress cannot restore them). Off = upstream pinning.
+  // ONLY images nested in a tool_result: a tool result's identity is tool
+  // name + text, so it survives the host re-uploading the image or switching
+  // its source (base64 <-> file). A TOP-LEVEL file image stays pinned even
+  // with the switch on — a file source has no bytes to fingerprint, so every
+  // top-level file image shares one identity base and is told apart only by
+  // its position (wire/anthropic.ts, wire/message-id.ts): one sibling changing
+  // shifts the whole family and a block would cover a DIFFERENT image, and a
+  // source switch re-mints the id so a folded image comes back for good.
+  const hostFileFoldable = (source: Record<string, unknown> | undefined): boolean =>
+    opts?.foldHostFileImages === true && isHostHeldFileSource(source);
 
   // A verbatim anthropic system message carrying control-plane state (Pi's
   // tool_addition deltas, message-level output_config): folding it would
@@ -674,7 +687,7 @@ export function hasUnrecoverableMediaPayload(msg: CoreMessage): boolean {
           const blk = asObj(b);
           if (!blk || blk.type === "text") continue;
           if (blk.type === "image") {
-            if (!anthropicSourceArchivable(asObj(blk.source)))
+            if (!anthropicSourceArchivable(asObj(blk.source)) && !hostFileFoldable(asObj(blk.source)))
               return !hasRefRecoverableMediaPayload(msg);
             continue;
           }

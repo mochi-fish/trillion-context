@@ -509,6 +509,25 @@ export interface TruncateConfig {
    *  compression and zero truncation savings before terminalEscape fires
    *  (#300). Default 3. Set 0 to disable the signal. */
   terminalEscapeAfter?: number;
+  /** fork (companion lane): when true, an ESTIMATE-grade reading
+   *  (processTurn({ tokenCountSource: "estimate" }) — e.g. the turn right
+   *  after an aborted send whose usage never settled) never cuts NEW bytes:
+   *  the node treats it as under the watermark (latched clips still replay
+   *  byte-identically, nothing new is clipped, the terminal streak is held,
+   *  not advanced). Billed readings ("usage") and hosts that omit the source
+   *  marker truncate exactly as before. Pressure nudges are unaffected (they
+   *  have their own estimate hold, nudge.requireUsageSampleForPressure).
+   *  Unset / false = upstream behavior, byte-identical. Hosts whose upstream
+   *  NEVER reports usage must leave this off: they would never truncate. */
+  requireUsageSample?: boolean;
+  /** fork (multi-model, R4): the host marks THIS turn as one of the first
+   *  turns after a model/route switch, whose reading may be stale (the
+   *  previous request's billed size, taken before the proxy re-attached its
+   *  folds). When true the node cuts nothing new — exactly the
+   *  requireUsageSample estimate hold: latched clips replay byte-identically,
+   *  the terminal streak is held. Nudges are unaffected. Unset / false =
+   *  upstream behavior, byte-identical. */
+  holdFreshCuts?: boolean;
 }
 
 export interface CompressValidationConfig {
@@ -614,6 +633,18 @@ export interface Config {
    *  core run immediately preceding a moved pair — ONLY cores accepted by
    *  reasoningDroppable. Default off; both flags must be set to drop anything. */
   compressAtFoldPointClearThinking?: boolean;
+  /** fork (companion lane): Anthropic `source.type: "file"` images — the host
+   *  keeps the original and re-uploads it under a fresh file id whenever the
+   *  provider-side copy nears expiry (DeepSeek: 7 days), the proxy only ever
+   *  sees an opaque id. Default (unset/false) keeps the upstream behavior: such
+   *  a message carries no archivable bytes and no durable re-access handle, so
+   *  it is pinned (BLOCKED ref, never folded). true makes it FOLDABLE: the
+   *  pixels simply leave the view (the host still holds them); the file id is
+   *  NEVER recorded as a re-access handle (MEDIA REFS stays url-only) and
+   *  decompress cannot bring the image back. See media-refs.ts. Only images
+   *  nested in a tool_result: a top-level file image keeps pinning (its
+   *  identity is positional — see hasUnrecoverableMediaPayload). */
+  foldHostFileImages?: boolean;
   /** Host predicate for the above drop: signed-thinking blocks and strict-echo
    *  sessions must answer false (wire signatures live host-side, #1658/#684
    *  doctrine). UNSET ⇒ no reasoning core is ever dropped, even with

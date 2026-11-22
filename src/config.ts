@@ -17,6 +17,8 @@ import type { ReasoningGuardConfig } from "./reasoning-guard.js";
 import type { OutputSteeringConfig } from "./output-steering.js";
 import { parseExternalSummaryChain, type ExternalSummaryChain, validSummaryCredentialName } from "./external-summary-settings.js";
 import { parseBillingSettings, setBillingOverrides } from "./billing.js";
+import { sanitizeSearchV2Fields, type SearchV2Raw } from "./search-cjk/settings.js";
+import { parseFishSettings, type FishSettings } from "./fish/date-notes-settings.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -206,6 +208,51 @@ export type ModelEntry = {
  *  (`providers[url].models[model].compress`) — merged deepest-field-wins by
  *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
  *  field is optional; unset fields fall through to the kernel default. */
+/** fork（养成向）：一个会话自己的覆盖（见 CompressSettings.sessions）。 */
+export type SessionCompressOverride = {
+    /** 同 CompressSettings.modelContextLimit：绝对数，或 "70%" 这种按模型
+     *  真实窗口算的比例。比全局 / 提供方 / 模型三级都优先。 */
+    modelContextLimit?: number | string;
+    /** 同 CompressSettings.noGhostwrite，只管这一条会话。 */
+    noGhostwrite?: boolean;
+    /** 同 CompressSettings.foldHostFileImages，只管这一条会话（帮手、子代理不跟着放开）。 */
+    foldHostFileImages?: boolean;
+    /** 同 CompressSettings.epochMajorityGuard，只管这一条会话。 */
+    epochMajorityGuard?: boolean;
+    /** 同 CompressSettings.requireUsageSampleForTruncate，只管这一条会话。 */
+    requireUsageSampleForTruncate?: boolean;
+    /** 同 CompressSettings.foldHostFileImagePaths，只管这一条会话。 */
+    foldHostFileImagePaths?: boolean;
+    /** fork（多模型，M5）：判窗怎么算。"window"（缺省）= 和上游一样（原生窗口或
+     *  modelContextLimit，再扣输出预留）；"input" = 按「能用的输入」算：
+     *  judgeBase = min(modelContextLimit, quality, ⌊原生窗口 × safety⌋ − min(max_tokens, 0.25 × 原生窗口))，
+     *  直接当成扣过预留以后的判窗。safety / quality / window 取 compress.modelWindows
+     *  里这个模型那一行；没有那一行时 safety 0.85、不封顶。原生窗口拿不到时照 "window" 算。 */
+    limitMode?: "window" | "input";
+    /** fork（多模型，M7）：Anthropic 线上签名思考的前缀绑定兜底。"off"（缺省）= 不管；
+     *  "strip_retry" = 上游回那条「bound to a different conversation」的 400 时，把这一份
+     *  外发副本里的 thinking / redacted_thinking 全去掉，只重发一次；会话和账本里的原文不动。 */
+    anthropicThinkingBinding?: "off" | "strip_retry";
+    /** fork（多模型，M8）：OpenAI 线上 assistant 消息的 `reasoning` / `reasoning_text`
+     *  （vLLM 新版这样回）当成 reasoning_content 来估算、来折叠；外发时用原来的字段名。
+     *  缺省 = 只认 reasoning_content（和上游一样）。 */
+    openaiReasoningAliases?: boolean;
+    /** fork（多模型，R4）：换模型或换路线以后，头 N 份请求只催压、不新做紧急截断
+     *  （已经锁住的照旧重放）。1–8；缺省 = 不按住。 */
+    truncateHoldAfterSwitch?: number;
+};
+
+/** fork（多模型，M5）：compress.modelWindows 的一行。键写 "<provider>/<model>"
+ *  或者只写 model；请求的 model 先按整串认，再按「/」后面那段认（只认唯一的一行）。 */
+export type ModelWindowEntry = {
+    /** 这个模型真正的原生窗口上限。和宿主报来的取小的那个（宿主报错了也不会超过它）。 */
+    window?: number;
+    /** 安全系数，0.5–1；缺省 0.85。 */
+    safety?: number;
+    /** 质量 / 速度上限（token），可选。 */
+    quality?: number;
+};
+
 export type CompressSettings = {
     /** External summary chain — three-level like every other compress field
      *  (whole-chain replace at provider/model level, no sub-merge). File shape:
@@ -224,6 +271,63 @@ export type CompressSettings = {
      *  table / registry and the legacy `modelContextLimit` / per-model
      *  `context`. See {@link resolveContextLimitValue}. */
     modelContextLimit?: number | string;
+    /** fork（养成向）：按会话的覆盖，优先级在全局 / 提供方 / 模型三级之上。
+     *  键是会话身份：代理自己的会话 id（DSH 插件车道上就是 DSH 的会话 id，
+     *  形如 `session-…`），也认这一次请求的 `x-bili-plugin-conversation` 头。
+     *  只在全局 `compress` 这一级读（写在 providers.* 里的不认），只收
+     *  {@link SessionCompressOverride} 列出的几样；别的键、写坏的值都不生效，
+     *  只打一次 warn。没写这个键 = 和上游完全一样。 */
+    sessions?: Record<string, SessionCompressOverride>;
+    /** fork（多模型，M5）：按模型的窗口表，只给 sessions.<id>.limitMode = "input" 的会话用。
+     *  只在全局 `compress` 这一级读；写坏的行不生效，只打一次 warn。没写 = 空表。
+     *  见 {@link ModelWindowEntry}。 */
+    modelWindows?: Record<string, ModelWindowEntry>;
+    /** fork（养成向）：「不代写」。true 时越过上限也只催模型自己压：preflight
+     *  代写（模型摘要、外部摘要、确定性摘要、分层合并）、externalSummary 替模型
+     *  的 compress 补写摘要、autoFold 增长折叠，这几条路都不走；每次本来要代写
+     *  时在会话 metadata.noGhostwrite 里记一个数。请求超过模型真实窗口时照旧
+     *  报失败（不代写就放不下）。三级都能写（深的一级赢），按会话的覆盖
+     *  （sessions.<id>.noGhostwrite）比三级都优先。不写 = 和上游一样。 */
+    noGhostwrite?: boolean;
+    /** fork（养成向）：Anthropic 线上 `source.type: "file"` 的图（宿主拿着原图、
+     *  代理只见到一个会过期的 file_id）能不能折。true = 能折：像素离开视图，
+     *  file_id 不当成能取回的句柄写进摘要（MEDIA REFS 只认网址），摘要尾巴写
+     *  「图已折起，原图在宿主那边」，decompress 拿不回图；发给上游的图片块只用
+     *  这一次宿主送来的，凡是这次请求里没有的 file_id 一律换成占位字。只放
+     *  工具结果里的图：顶层（直接贴在消息里）的 file 图照旧钉住——它的身份
+     *  只靠位置区分，前面一张一变就会盖错图。不写 / false = 和上游一样钉住。
+     *  三级都能写（深的一级赢），也能按会话写（sessions.<id>.foldHostFileImages）。 */
+    foldHostFileImages?: boolean;
+    /** fork（养成向）：搬自上游 #5737（v0.1.214，修 #5715）的「活着的多数」判断。
+     *  true 时，对账时活着的块盖住的硬消息若严格过半仍原样在线上，就不置
+     *  「等确认」记号（foldEpochConfirmPending），已经挂着的当场清掉。不写 /
+     *  false = 和 0.1.213 一样（记号照旧会置上、要等确认才清）。记号只挡
+     *  preflight 代写：没开 noGhostwrite 时打开它，越线时代理会恢复代写。
+     *  三级都能写（深的一级赢），也能按会话写（sessions.<id>.epochMajorityGuard）。 */
+    epochMajorityGuard?: boolean;
+    /** fork（养成向）：紧急截断只认落了账的真用量。true 时，这一次判大小用的是
+     *  估计值（上一份请求被掐断、用量没落账之后，代理拿本地估计当用量，常是
+     *  真用量的 1.5–1.9 倍），内核的 emergency-truncate 就不剪新的：已经锁住的
+     *  照旧重放，等下一次真用量回来再判。催压不受影响（催压自己有估计值的
+     *  hold：requireUsageSampleForPressure）。上游从来不回用量的线路别开：那样
+     *  就永远不剪了。映射到内核字段 truncate.requireUsageSample。三级都能写
+     *  （深的一级赢），也能按会话写（sessions.<id>.requireUsageSampleForTruncate）。
+     *  不写 / false = 和上游一样。 */
+    requireUsageSampleForTruncate?: boolean;
+    /** fork（养成向）：文件图折起时留「图片路径」占位。只在 foldHostFileImages 也是
+     *  true 时起作用。true 时，她自己 compress 建新块，块摘要末尾那段「这一段里有 N 张图，
+     *  已折起…」改成列出每张图在宿主附件库里的只读副本路径（`~/…/attachments/v1/objects/
+     *  xx/<64 位>`，从宿主每张图前面的 handle 文字里认出来，去掉家目录，所以没有系统
+     *  用户名），她以后用 read_image 读这个路径就能再看；屏幕截图（mcp__wincu__ 工具）、
+     *  read_image 读的是临时目录里的文件、副本不在、认不出的，照实写不留路径的原因。
+     *  base64 的图也列。compress 的回执附上同一段；并块时把子块的那段带上来（一块最多
+     *  16 行）；decompress({ imageRef }) 取不到图时，认得出是宿主的文件图就给路径。
+     *  已经建好的块、历史消息一律不改。家目录默认 os.homedir()，环境变量 BILI_HOST_HOME
+     *  能换（宿主和代理不在同一个用户目录下时）。三级都能写（深的一级赢），也能按会话写
+     *  （sessions.<id>.foldHostFileImagePaths）。不写 / false = 和上游一样。
+     *  注意：不认这个键的旧构建，网页设置面板那条严格解析见到它会整个 sessions 块不认，
+     *  所以只能在认它的构建装上以后才写。 */
+    foldHostFileImagePaths?: boolean;
     /** Cap on the output-headroom reservation as a fraction of the context
      *  window: reserved = min(max_tokens, pct × window), so the kernel's
      *  nudge/truncate bands sit below (window − reserved). Accepts a ratio
@@ -384,10 +488,11 @@ export type CompressSettings = {
     protectedLatestTools?: string[];
     /* (durable virtual paths) dsh lanes project their durable-state TEXT
      *  carriers to `durable/<name>` identities (#2446 family: skill catalog,
-     *  mcp catalog, agents-md baseline, runtime-context snapshot), so the
-     *  same pattern machinery governs them: `"durable/*"` keeps the LATEST
-     *  instance of every carrier (all four are cumulative snapshots — the
-     *  older catalogs/baselines fold away). Default when nothing is
+     *  mcp catalog, agents-md baseline, runtime-context snapshot, in-history
+     *  system-prompt update), so the same pattern machinery governs them:
+     *  `"durable/*"` keeps the LATEST instance of every carrier (all five
+     *  are cumulative snapshots — the older catalogs/baselines/prompt copies
+     *  fold away). Default when nothing is
      *  configured: `durable/*` latest-per-identity in
      *  `protectedLatestTools` (pi-reference single-live-copy semantics —
      *  skill/MCP visibility can never be lost, superseded snapshots
@@ -582,7 +687,7 @@ export type CompressSettings = {
         /** Enable plan-aware re-ranking + steering for search_context.
          *  Absent/false = off (byte-identical output). */
         planAware?: boolean;
-    };
+    } & SearchV2Raw;
     /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
      *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
      *  plugin manifest): passing a short `rule` records a principle-level
@@ -995,6 +1100,10 @@ export type ProxyOptions = {
      *  override it, env BILI_IMAGE_TOKEN_CAP overrides both. Positive integer;
      *  undefined/unset = no cap. */
     imageTokenCap?: number;
+    /** fork（多模型，M6）：证据账的附加字段。见 FileConfig.fishLedger。 */
+    fishLedger?: { recordEstimate?: boolean };
+    /** fork（日期）：见 FileConfig.fish。没写 = 不带这个键。 */
+    fish?: FishSettings;
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -1768,6 +1877,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         imageTokenCap: parseImageTokenCap(fileConfig.imageTokenCap),
+        ...parseFishLedgerSettings(fileConfig.fishLedger),
+        ...fishOptionOf(fileConfig.fish),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
@@ -2095,6 +2206,17 @@ type FileConfig = {
     /** #1843 L3: global per-image token ceiling (positive integer); per-route
      *  `imageTokenCap` overrides it, env BILI_IMAGE_TOKEN_CAP wins over both. */
     imageTokenCap?: number;
+    /** fork（多模型，M6）：证据账（fish-ledger）的附加字段。`recordEstimate: true` 时，
+     *  每一行 usage provider 多带一个 `est`（这份请求的本地文字估计、外发图数、
+     *  当时的 k̂），给离线拟合加性校准用。缺省 / false = 和上游一样，一个字段都不多。
+     *  改了以后 POST /__bili/config/reload 生效。 */
+    fishLedger?: { recordEstimate?: boolean };
+    /** fork（日期）：`fish.dateNotes` —— 翻旧话的工具结果（search_context 的摘录 / around、decompress）里，
+     *  给「下周三」「大后天」这类说法补「（=日期）」注记（每条原话按它自己发生的那天算）；`recordOccurrence`
+     *  另记一张「消息真正发生的时刻」旁路表（session_ext 的 fish:occ:YYYYMM）。缺省全关；关着时工具结果和
+     *  旁路表都和没有这一块时逐字节一样。块里有一个键或值不对，整块当没写（全关）。改了以后
+     *  POST /__bili/config/reload 或设置页保存当场生效。 */
+    fish?: { dateNotes?: { enabled?: boolean; summaries?: boolean; tzOffsetMin?: number; nightEndHour?: number; maxPerResult?: number; maxPerSnippet?: number; recordOccurrence?: boolean } };
     /** Claude-native port override (#964/#1660): an explicit port for the
      *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
      *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
@@ -2467,6 +2589,10 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     "autoModeForge", "imageRescale", "guardrails",
     // #3376:
     "cacheKeepalive",
+    // fork（多模型，M6）：
+    "fishLedger",
+    // fork（日期）：
+    "fish",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:
@@ -2488,6 +2614,10 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "maxSummaryLength", "minSummaryLength",
     // Experimental fold-point carrier relocation switches (view-only).
     "compressAtFoldPoint", "compressAtFoldPointClearThinking",
+    // fork: per-session overrides (global compress level only) + no-ghostwrite.
+    "sessions", "noGhostwrite", "foldHostFileImages", "epochMajorityGuard", "requireUsageSampleForTruncate", "foldHostFileImagePaths",
+    // fork（多模型，M5）：按模型的窗口表（全局 compress 这一级）。
+    "modelWindows",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -3151,6 +3281,106 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
+/** fork: the keys a per-session override may carry. Anything else is reported
+ *  and ignored — the session block is deliberately narrow (the per-request
+ *  prompts/surface/ccr cascade resolves before the session is bound, so a
+ *  wider block would silently half-apply). */
+const SESSION_OVERRIDE_KEYS = ["modelContextLimit", "noGhostwrite", "foldHostFileImages", "epochMajorityGuard", "requireUsageSampleForTruncate", "foldHostFileImagePaths", "limitMode", "anthropicThinkingBinding", "openaiReasoningAliases", "truncateHoldAfterSwitch"] as const;
+
+/** fork: validate ONE per-session override. Returns the cleaned value (only
+ *  valid known fields) plus the problems found; an override with no valid
+ *  field comes back as `value: undefined`. Shared by the strict web-panel
+ *  parser (any problem rejects) and the lenient request-time resolver (bad
+ *  fields are dropped with a warn). */
+export function sanitizeSessionCompressOverride(raw: unknown): { value?: SessionCompressOverride; problems: string[] } {
+    const problems: string[] = [];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { problems: ["not an object"] };
+    const o = raw as Record<string, unknown>;
+    const out: SessionCompressOverride = {};
+    for (const key of Object.keys(o)) {
+        if (!(SESSION_OVERRIDE_KEYS as readonly string[]).includes(key)) problems.push(`unknown key "${key}"`);
+    }
+    if ("modelContextLimit" in o && o.modelContextLimit !== undefined) {
+        const v = o.modelContextLimit;
+        if (typeof v === "number" && Number.isFinite(v) && v > 0) out.modelContextLimit = v;
+        else if (typeof v === "string" && /^\s*\d+(\.\d+)?\s*%\s*$/.test(v) && Number.parseFloat(v) > 0) out.modelContextLimit = v.trim();
+        else if (typeof v === "string" && /^\s*\d+\s*$/.test(v) && Number(v) > 0) out.modelContextLimit = Number(v);
+        else problems.push(`modelContextLimit must be a positive number or a "N%" string`);
+    }
+    for (const key of ["noGhostwrite", "foldHostFileImages", "epochMajorityGuard", "requireUsageSampleForTruncate", "foldHostFileImagePaths", "openaiReasoningAliases"] as const) {
+        if (!(key in o) || o[key] === undefined) continue;
+        if (typeof o[key] === "boolean") out[key] = o[key] as boolean;
+        else problems.push(`${key} must be a boolean`);
+    }
+    // fork（多模型）：M5 / M7 / R4 的按会话键。
+    if ("limitMode" in o && o.limitMode !== undefined) {
+        if (o.limitMode === "window" || o.limitMode === "input") out.limitMode = o.limitMode;
+        else problems.push(`limitMode must be "window" or "input"`);
+    }
+    if ("anthropicThinkingBinding" in o && o.anthropicThinkingBinding !== undefined) {
+        if (o.anthropicThinkingBinding === "off" || o.anthropicThinkingBinding === "strip_retry") out.anthropicThinkingBinding = o.anthropicThinkingBinding;
+        else problems.push(`anthropicThinkingBinding must be "off" or "strip_retry"`);
+    }
+    if ("truncateHoldAfterSwitch" in o && o.truncateHoldAfterSwitch !== undefined) {
+        const v = o.truncateHoldAfterSwitch;
+        if (typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 8) out.truncateHoldAfterSwitch = v;
+        else problems.push(`truncateHoldAfterSwitch must be an integer 0–8`);
+    }
+    return { value: Object.keys(out).length > 0 ? out : undefined, problems };
+}
+
+/** fork（日期）：顶层 fish 块（严格；写坏 = 整块当没写，记一行 warn）。没写 = 不带这个键。 */
+function fishOptionOf(raw: unknown): { fish?: FishSettings } {
+    const { fish, problems } = parseFishSettings(raw);
+    if (problems.length > 0) loggerLog("warn", `[config] fish block ignored (all date notes off): ${problems.slice(0, 4).join("; ")}`);
+    return fish !== undefined ? { fish } : {};
+}
+
+/** fork（多模型，M6）：顶层 fishLedger 块。只认 recordEstimate（布尔）；没写或写坏 = 不带这个键。 */
+export function parseFishLedgerSettings(raw: unknown): { fishLedger?: { recordEstimate: boolean } } {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const v = (raw as { recordEstimate?: unknown }).recordEstimate;
+    return typeof v === "boolean" ? { fishLedger: { recordEstimate: v } } : {};
+}
+
+/** fork（多模型，M5）：查一行 compress.modelWindows。只留认得的、值对的字段。 */
+export function sanitizeModelWindowEntry(raw: unknown): { value?: ModelWindowEntry; problems: string[] } {
+    const problems: string[] = [];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { problems: ["not an object"] };
+    const o = raw as Record<string, unknown>;
+    const out: ModelWindowEntry = {};
+    for (const key of Object.keys(o)) {
+        if (key !== "window" && key !== "safety" && key !== "quality") problems.push(`unknown key "${key}"`);
+    }
+    for (const key of ["window", "quality"] as const) {
+        if (!(key in o) || o[key] === undefined || o[key] === null) continue;
+        const v = o[key];
+        if (typeof v === "number" && Number.isInteger(v) && v >= 1000) out[key] = v;
+        else problems.push(`${key} must be an integer ≥ 1000`);
+    }
+    if ("safety" in o && o.safety !== undefined && o.safety !== null) {
+        const v = o.safety;
+        if (typeof v === "number" && Number.isFinite(v) && v >= 0.5 && v <= 1) out.safety = v;
+        else problems.push(`safety must be a number in [0.5, 1]`);
+    }
+    return { value: Object.keys(out).length > 0 ? out : undefined, problems };
+}
+
+/** fork: strict parse of `compress.sessions` for the web panel round-trip —
+ *  undefined on any problem (the caller then rejects the whole block, the
+ *  same contract as every other compress field). */
+function parseSessionOverrides(raw: unknown): Record<string, SessionCompressOverride> | undefined {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const out: Record<string, SessionCompressOverride> = {};
+    for (const [id, entry] of Object.entries(raw as Record<string, unknown>)) {
+        if (id.trim().length === 0) return undefined;
+        const { value, problems } = sanitizeSessionCompressOverride(entry);
+        if (problems.length > 0) return undefined;
+        if (value !== undefined) out[id] = value;
+    }
+    return out;
+}
+
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
@@ -3248,7 +3478,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     // #5683: unprompted/out-of-bounds compression policy gates — plain booleans,
     // off unless explicitly set (an explicit false at a deeper level disables).
-    for (const key of ["requireNudge", "requireRecommendation"] as const) {
+    for (const key of ["requireNudge", "requireRecommendation", "noGhostwrite", "foldHostFileImages", "epochMajorityGuard", "requireUsageSampleForTruncate", "foldHostFileImagePaths"] as const) {
         if (!(key in obj)) continue;
         if (typeof obj[key] !== "boolean") ok = false;
         else out[key] = obj[key];
@@ -3392,6 +3622,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 if (typeof v !== "boolean") { ok = false; continue; }
                 cleaned.planAware = v;
             }
+            // fork search v2 (11-20): engine / around / cleaning patterns /
+            // weights — only keys that are present are read, so a block
+            // without them sanitizes exactly as before.
+            if (!sanitizeSearchV2Fields(co, cleaned as Record<string, unknown>)) ok = false;
             if (ok) out.search = cleaned;
         }
     }
@@ -3416,6 +3650,31 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("promptPack" in obj && obj.promptPack !== undefined) {
         if (typeof obj.promptPack !== "string" || obj.promptPack.trim().length === 0) ok = false;
         else out.promptPack = obj.promptPack.trim();
+    }
+    // fork: per-session overrides — same "a bad value rejects the whole block"
+    // contract as every other field here (the web panel round-trips through
+    // this parser; the file tier is validated again at request time by
+    // sanitizeSessionCompressOverride, which drops bad entries instead).
+    if ("sessions" in obj && obj.sessions !== undefined) {
+        const parsedSessions = parseSessionOverrides(obj.sessions);
+        if (parsedSessions === undefined) ok = false;
+        else out.sessions = parsedSessions;
+    }
+    // fork（多模型，M5）：同样的「写坏一处整块不认」（网页面板走这里）；
+    // 文件那一层在请求时由 sanitizeModelWindowEntry 再查一遍、坏行丢掉。
+    if ("modelWindows" in obj && obj.modelWindows !== undefined) {
+        const mw = obj.modelWindows;
+        if (!mw || typeof mw !== "object" || Array.isArray(mw)) {
+            ok = false;
+        } else {
+            const cleaned: Record<string, ModelWindowEntry> = {};
+            for (const [key, entry] of Object.entries(mw as Record<string, unknown>)) {
+                const { value, problems } = sanitizeModelWindowEntry(entry);
+                if (key.trim().length === 0 || problems.length > 0 || value === undefined) { ok = false; continue; }
+                cleaned[key] = value;
+            }
+            if (ok) out.modelWindows = cleaned;
+        }
     }
     if ("reasoningGuard" in obj && obj.reasoningGuard !== undefined) {
         const rg = obj.reasoningGuard;

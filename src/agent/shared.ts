@@ -186,10 +186,31 @@ export function effectiveToolTimeoutMs(proxyBase: string, tool: string): number 
     return Math.max(TOOL_TIMEOUT_MS, advertised + TOOL_TIMEOUT_OVERHEAD_MARGIN_MS);
 }
 
+// fish-ledger P0: capabilities the proxy at each base declared in its manifest
+// (capabilities.fishLedger.features). Recorded on EVERY manifest fetch — a
+// manifest without the declaration clears the base's entry, so an older build
+// answering at the same origin is never credited with a newer one's features.
+const manifestCapabilities = new Map<string, Set<string>>();
+
+function recordManifestCapabilities(proxyBase: string, json: unknown): void {
+    const features = (json as { capabilities?: { fishLedger?: { features?: unknown } } })?.capabilities?.fishLedger?.features;
+    if (Array.isArray(features)) {
+        manifestCapabilities.set(proxyBase, new Set(features.filter((f): f is string => typeof f === "string")));
+    } else {
+        manifestCapabilities.delete(proxyBase);
+    }
+}
+
+/** fish-ledger P0: the capability set the proxy at `proxyBase` last declared. */
+export function manifestCapabilitiesFor(proxyBase: string | undefined): ReadonlySet<string> | undefined {
+    return proxyBase === undefined ? undefined : manifestCapabilities.get(proxyBase);
+}
+
 export async function fetchManifest(proxyBase: string, format: "anthropic" | "openai" = "anthropic"): Promise<ManifestTool[]> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
     recordManifestToolDuration(proxyBase, json);
+    recordManifestCapabilities(proxyBase, json);
     if (format === "openai") {
         // The proxy serves OpenAI entries NESTED — {type:"function",
         // function:{name,description,parameters}} — mirroring the wire injector

@@ -9,7 +9,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteFishEgress, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { billOutputUsage } from "../billing.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import { countImagesInParsedBody, countImagesInRawBody } from "../image-tokens.js";
@@ -31,6 +31,8 @@ import { recordThreadTail } from "../server/thread-tracking.js";
 import { applyRanges } from "../stream.js";
 import { applyConfiguredCompression } from "../external-summary-compress.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
+import { maybeSearchV2, type SearchLane } from "../search-v2.js";
+import { fishDateNotesWanted, readyFishDateNotes } from "../fish/date-notes.js";
 import { toolFail, type ProxyToolResult } from "../proxy-tool-result.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { noteUpstreamThrottle429, noteUpstreamThrottleResolved, throttle429ModelScope } from "../upstream-throttle.js";
@@ -263,6 +265,10 @@ export interface LoopCtx {
      *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
+    /** fork search v2 (11-20): set by the plugin lane only — the BASE
+     *  config's compress.search (gates the optional `around` argument the
+     *  manifest advertises). Absent elsewhere ⇒ `around` is ignored. */
+    searchLane?: SearchLane;
 }
 
 export interface RequestOptions {
@@ -394,6 +400,14 @@ export async function executeProxyToolAsync(
     // carries the image bytes; the loop attaches them as an ephemeral carrier
     // message (see proxyResults below).
     if (toolName === READ_ORIGINAL_IMAGE_TOOL_NAME) return executeReadOriginalImage(args, ctx.session, (lvl, msg) => ctx.log(`[${lvl}] ${msg}`));
+    if (toolName === "search_context") {
+        // fork search v2 (11-20): the cjk engine / around continuation; null
+        // (switches off, no unified store, foreign session) ⇒ the old path.
+        const v2 = await maybeSearchV2(args, ctx.session, ctx.searchLane, ctx.log);
+        if (v2) return v2;
+    }
+    // fork（日期）：decompress 是同步的，开着时先等 reldate 载好（核过 sha）；关着时不等
+    if (toolName === "decompress" && fishDateNotesWanted()) await readyFishDateNotes();
     if (toolName !== "compress") return executeProxyTool(toolName, args, ctx, callId, rawArguments);
     const input = typeof rawArguments === "string" && rawArguments.length > 0 ? rawArguments : args;
     return applyConfiguredCompression(input, ctx, callId, signal);
@@ -467,7 +481,7 @@ function recordUsage(
         `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
     if (total > 0 || reportedCached !== null) {
-        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined });
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, creation: typeof usage.creationTokens === "number" ? usage.creationTokens : undefined }, undefined, "loop");
     }
 }
 
@@ -558,7 +572,9 @@ export async function* runCompressLoop(
         const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
-        noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        const loopSame = noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
+        // fish-ledger P0 (egress, lane loop): the round's exact outbound bytes.
+        noteFishEgress({ lane: "loop", body: wireBodyStr, upstreamUrl: requestOptions.url, model: typeof wireObj.model === "string" ? wireObj.model : undefined, msgs: wireArr !== undefined ? wireArr.length : null, samePayload: loopSame, sid: ctx.session.id });
         if (prevSentFull) {
             maybeJudgeContinuity(prevSentFull, wireBodyStr, ctx.protocol, ctx.session.id);
         }

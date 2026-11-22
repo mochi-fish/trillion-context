@@ -65,7 +65,8 @@ import { MIN_ASSUMED_WINDOW_TOKENS } from "../util.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { bodyOverWindowDetail as sharedBodyOverWindowDetail, installNativeFetchIntercept, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, routedBiliModelUrl, type GateVerdict, type NativeInterceptState } from "./native-intercept.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, manifestCapabilitiesFor, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { bumpFishClientStat, FISH_REQUEST_CAPABILITY, FISH_REQUEST_HEADER, fishRequestIdForRequest } from "../fish-request.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalRejection, noteIncrementalAck, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { declareDshCompactionActive, detectCompactionOverlayGap, dshCompactionGateTelemetry } from "./dsh-compaction-disable.js";
@@ -244,7 +245,50 @@ type RegisterState = {
     giveUpSeq: number;
 };
 
-const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0 };
+// fish-ledger P0 capability gate: the request-id header may only ride to a
+// proxy that declared it strips the header (manifest capabilities). The
+// declaration is bound to the register: EVERY write of register.base (a new
+// origin, a recovery, a give-up) and every toolsReady→false bumps this
+// generation, so a declaration learned for an earlier world can never be used
+// for the next one — even when a different build later answers at the same
+// origin. Accessors catch all the write sites without touching them.
+let fishCapGen = 0;
+let fishCap: { base: string; gen: number } | undefined;
+let fishCapProbedGen = -1;
+let registerBase: string | undefined;
+let registerToolsReady = false;
+
+const register: RegisterState = {
+    get base() { return registerBase; },
+    set base(v: string | undefined) { registerBase = v; fishCapGen++; },
+    get toolsReady() { return registerToolsReady; },
+    set toolsReady(v: boolean) { registerToolsReady = v; if (!v) fishCapGen++; },
+    dead: false, retryAt: 0, pending: undefined, failStreak: 0, lastRegistrationError: undefined, giveUpSeq: 0,
+};
+
+/** True only while the CURRENT base declared the request-id capability in a
+ *  manifest fetched within this register generation. */
+function fishCapValid(): boolean {
+    return fishCap !== undefined && fishCap.gen === fishCapGen && fishCap.base === register.base && register.toolsReady;
+}
+
+/** Land a fetched declaration only if the world did not move meanwhile. */
+function adoptFishCap(base: string, gen: number): void {
+    if (gen === fishCapGen && register.base === base && register.toolsReady && manifestCapabilitiesFor(base)?.has(FISH_REQUEST_CAPABILITY) === true) {
+        fishCap = { base, gen };
+    }
+}
+
+/** A re-based register whose tools stayed registered (a respawn keeps them,
+ *  #3380) never re-fetches the manifest; probe it once per generation so the
+ *  new proxy's declaration (or its absence) is learned. Loopback only. */
+function refreshFishCap(): void {
+    const base = register.base;
+    if (base === undefined || !register.toolsReady || fishCapProbedGen === fishCapGen) return;
+    const gen = fishCapGen;
+    fishCapProbedGen = gen;
+    void fetchManifest(base, "anthropic").then(() => adoptFishCap(base, gen), () => undefined);
+}
 
 // #3616: generation of the origin plane. Each non-off apply() (and each test
 // reset) establishes a new world; an in-flight verify/spawn flight from an
@@ -984,6 +1028,8 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.pending !== undefined) return register.pending;
     const base = register.base;
     if (register.toolsReady || base === undefined) return;
+    // fish-ledger P0: the generation this registration flight starts in.
+    const capGen = fishCapGen;
     register.pending = (async () => {
         const tools = await fetchManifest(base, "anthropic");
         // #2082: land on the CURRENT context, not the one that started this
@@ -1011,6 +1057,11 @@ async function registerTools(ctx: PluginContext): Promise<void> {
         register.toolsReady = true;
         register.failStreak = 0;
         register.lastRegistrationError = undefined;
+        // fish-ledger P0: bind the declaration this manifest carried to the
+        // base/generation it was fetched in (dropped if either moved meanwhile
+        // — the first tagged request then probes the current base, lazily, so
+        // hosts that never tag anything never pay an extra manifest fetch).
+        adoptFishCap(base, capGen);
     })()
         .catch((err: unknown) => {
             // Cordis deactivates the plugin context while the host tears down
@@ -1169,6 +1220,8 @@ type GateAttribution =
 interface LlmDispatchScope {
     sid: string;
     msgIds: string[] | undefined;
+    /** fish-ledger P0: the host-side ledger's request id for this dispatch. */
+    fishReq?: string;
 }
 const dispatchScope = new AsyncLocalStorage<LlmDispatchScope>();
 
@@ -2029,6 +2082,17 @@ export function apply(ctx: PluginContext): void {
                 // — undefined (all-or-nothing) when any message lacks a usable
                 // id, so sidecar shapes degrade to id-less turns.
                 const scope: LlmDispatchScope = { sid, msgIds: hostMsgIdsOf(options?.messages) };
+                // fish-ledger P0: the host-side ledger tagged THIS request
+                // object (WeakMap, never a body field); carry it in the scope
+                // so headersFor can stamp the loopback hop. A malformed value
+                // is counted and dropped.
+                const fishReq = fishRequestIdForRequest(options);
+                if (typeof fishReq === "string") {
+                    scope.fishReq = fishReq;
+                    bumpFishClientStat("seen");
+                } else if (fishReq === null) {
+                    bumpFishClientStat("bad");
+                }
                 // #5403/#5418 v3: feed the per-slot id sequence into the
                 // watermark channel (the fetch chokepoint emits count +
                 // tail-ids; core = pf-channel.ts) — "?" slots ride id-less
@@ -2503,9 +2567,16 @@ export function apply(ctx: PluginContext): void {
 
     state.headersFor = (_url) => {
         maybeRetry(ctx);
-        if (!register.toolsReady) return undefined;
+        const fishReq = dispatchScope.getStore()?.fishReq;
+        if (!register.toolsReady) {
+            if (fishReq !== undefined) bumpFishClientStat("notOk");
+            return undefined;
+        }
         const attr = attributionOf(ctx);
-        if (attr.state !== "ok") return undefined;
+        if (attr.state !== "ok") {
+            if (fishReq !== undefined) bumpFishClientStat("notOk");
+            return undefined;
+        }
         const sid = attr.sid;
         ensureDshTitleReported(sid);
         // #2381: size this request against the model IT routes to — session
@@ -2530,8 +2601,26 @@ export function apply(ctx: PluginContext): void {
                 if (cached.maxOutput !== undefined) headers["x-bili-plugin-max-output"] = String(cached.maxOutput);
             }
         }
+        // fish-ledger P0: the request id rides the loopback hop only when the
+        // proxy at the CURRENT base declared it strips the header (capability
+        // gate, bound to this register generation). Otherwise nothing is
+        // stamped — an older proxy would forward an unknown header verbatim.
+        if (fishReq !== undefined) {
+            const v = fishCapValid() ? asciiHeaderValue(fishReq) : undefined;
+            if (v !== undefined) {
+                headers[FISH_REQUEST_HEADER] = v;
+                bumpFishClientStat("tagged");
+            } else {
+                bumpFishClientStat("noCapability");
+                refreshFishCap();
+            }
+        }
         return headers;
     };
+    // fish-ledger P0: a recovery retry re-sends headers computed for the dead
+    // origin; native-intercept keeps the request id only while the gate still
+    // holds for the origin it now sends to.
+    state.fishHeaderValidFor = (origin) => fishCapValid() && register.base === origin;
 
     // #4894: window source for the degraded direct path. The shared guard in
     // directSendOrRefuse measures against the stamped header — but headersFor
@@ -2855,6 +2944,8 @@ export function _resetRegisterForTest(base: string | undefined, toolsReady = fal
     state.lastUnavailableReason = undefined;
     register.base = base;
     register.toolsReady = toolsReady;
+    fishCap = undefined;
+    fishCapProbedGen = -1;
     register.dead = false;
     register.retryAt = 0;
     register.pending = undefined;

@@ -538,6 +538,14 @@ entries:
     group: envonly
     desc_en: "Spawn channel: marks a plugin-agent process."
     desc_zh: "派生通道：标记插件 agent 进程。"
+  - key: BILI_HOST_HOME
+    type: string
+    default: "unset (os.homedir())"
+    kind: env-only
+    audience: internal
+    group: envonly
+    desc_en: "Fork (compress.foldHostFileImagePaths): the home directory the host expands ~ against for read_image; image-path footers are written relative to it. Set only when the proxy and the host run under different home directories (or in a rehearsal rig). A too-shallow value (the Users folder itself, a drive root) lists no paths at all."
+    desc_zh: "fork（compress.foldHostFileImagePaths）：宿主给 read_image 展开 ~ 用的家目录，图片路径占位按它写成 ~ 相对路径。只在代理和宿主不在同一个家目录下（或演练架子里）才设。设得太浅（Users 那一层本身、盘符根目录）就一条路径都不留。"
   - key: BILI_IMAGE_RESCALE_MAX_DIM
     type: integer
     default: "1600"

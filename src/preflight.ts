@@ -13,16 +13,19 @@ import {
 import { createHash } from "node:crypto";
 import { yieldToEventLoop } from "./yield-loop.js";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
-import { IMAGE_PLACEHOLDER, imagePlaceholdersForSummary } from "./image-note.js";
+import { IMAGE_PLACEHOLDER, imageNoteOptions, imagePlaceholdersForSummary } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
+import { noteFishEgress } from "./cache-ledger.js";
+import { noteSideUsage } from "./fish-ledger-usage.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
-import { lastCompressSuffix, type Session } from "./session.js";
+import { lastCompressSuffix, markDirty, type Session } from "./session.js";
 import { epochConfirmPending } from "./fold-reconcile.js";
+import { noGhostwriteOn, noteGhostwriteBlocked } from "./no-ghostwrite.js";
 import { deadSkipKeys, filterDeadRanges, parseStructuralEmptyVerdict, recordDeadRange } from "./dead-ranges.js";
 import { peekRegistryOutputLimit } from "./registry.js";
 import { safePrefix } from "./text-safe.js";
@@ -351,6 +354,9 @@ export interface PreflightResult {
      *  ran; calls > 0 && attempts === 0 = pool dropped every batch before
      *  dispatch (congestion, not provider failure). */
     externalDispatch?: { calls: number; attempts: number };
+    /** fork: the no-ghostwrite switch stopped this walk before anything was
+     *  summarized on the model's behalf (see src/no-ghostwrite.ts). */
+    ghostwriteBlocked?: true;
     /** #2638: some round saw at least one range that passed every list-level gate
      *  (viability, minCompressRange, dead-range memory). The caller uses it to tell a
      *  failed fold chain (candidates existed, none delivered — backoff is right) from
@@ -1414,6 +1420,8 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             // summary call with 401 body-hash-mismatch and kill compression.
             const outHeaders = { "content-type": "application/json", ...summaryHeaders(deps) };
             deps.resign?.(outHeaders, body);
+            // fish-ledger P0 (egress, lane side): the proxy's own summary call.
+            noteFishEgress({ lane: "side", reason: "preflight-summary", body, upstreamUrl: deps.url, model: deps.model, sid: deps.session.id });
             const result = await fetchWithTimeout(deps.url, {
                 method: "POST",
                 headers: outHeaders,
@@ -1425,6 +1433,8 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
+            // fish-ledger P0 (usage, lane side): the summary call's own usage.
+            noteSideUsage({ protocol: deps.protocol, text, sid: deps.session.id, upstreamUrl: deps.url, model: deps.model });
             return text;
         } catch (err) {
             deps.signal?.throwIfAborted();
@@ -2209,6 +2219,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             }
             break;
         }
+        // fork: no-ghostwrite — this is the first point of the walk where the
+        // proxy would start summarizing on the model's behalf (model summary,
+        // external summary, deterministic digest, and — after futile rounds —
+        // tier distill all come after it). The round-top fit exit above already
+        // let a fitting payload through uncounted, so every pass that reaches
+        // here IS a would-be ghostwrite: count it and hand the forward/refuse
+        // decision back to the caller (which forwards while the model's real
+        // window still takes the payload — the compress nudge rides that
+        // request — and refuses otherwise). Nothing has been summarized yet.
+        if (noGhostwriteOn(deps.config)) {
+            const counts = noteGhostwriteBlocked(deps.session, "preflight");
+            markDirty(deps.session);
+            deps.log("warn", `[preflight] [no-ghostwrite] ${deps.session.id}: payload ~${Math.round(result.payloadEstimate)} tok over the target ${textTarget + imageReserve} (window ${limit}) — the proxy will NOT summarize on the model's behalf (blocked so far: preflight ${counts.preflight}, externalSummary ${counts.externalSummary}, autoFold ${counts.autoFold})`);
+            return { ...result, compressedRanges: 0, savedTokens: 0, rangesRemaining: (turn.nudge?.compressibleRanges ?? []).length, fitsWindow: false, hadFoldableCandidates: (turn.nudge?.compressibleRanges ?? []).length > 0, ghostwriteBlocked: true };
+        }
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
@@ -2576,7 +2601,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
                         const m = messages[i];
                         let text = m.text ?? "";
-                        const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                        const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id], imageNoteOptions(deps.config));
                         if (notes.length > 0) {
                             const note = notes.join(" ");
                             text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
@@ -2848,7 +2873,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
                     const m = messages[i];
                     let text = m.text ?? "";
-                    const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id]);
+                    const notes = imagePlaceholdersForSummary(m, byRaw?.[m.id], imageNoteOptions(deps.config));
                     if (notes.length > 0) {
                         const note = notes.join(" ");
                         text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;

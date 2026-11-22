@@ -21,6 +21,9 @@ import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
+import { fishLedgerRecordEstimateOn, noteEgress, noteUsage, upstreamHostOf, type EgressLane, type UsageEstimateFacts } from "./fish-ledger.js";
+import { fishOccRecordOn } from "./fish/date-notes.js";
+import { fishOccResponseEnd } from "./fish/store-readers.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
@@ -508,9 +511,61 @@ type Capture = {
     sentBody?: SeamSlot;
     inBody?: InboundSlot;
     imageFacts?: ForwardedImageFacts;
+    /** fish-ledger P0: the host's request id carried on the loopback hop
+     *  (validated); rides every egress / usage row of this forward. */
+    fishReq?: string;
+    /** fish-ledger P0: upstream sends noted for this capture so far. */
+    fishSends?: number;
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureOrder = 0;
+
+/** fish-ledger P0: attach the forward's (already validated) request id to the
+ *  live capture. No capture (session-less passthrough) → no-op. */
+export function setCaptureFishReq(fishReq: string | undefined): void {
+    const capture = captures.getStore();
+    if (capture !== undefined && fishReq !== undefined) capture.fishReq = fishReq;
+}
+
+/** fish-ledger P0: one egress row for a send that is about to leave, filed
+ *  under the live capture (id, round, request id, per-capture send counter).
+ *  Outside a capture the caller's fallbacks are used. Never throws. */
+export function noteFishEgress(a: {
+    lane: EgressLane;
+    reason?: string | null;
+    body: string | Uint8Array | undefined | null;
+    upstreamUrl?: string;
+    model?: string;
+    msgs?: number | null;
+    samePayload?: boolean | null;
+    sid?: string;
+    fishReq?: string;
+    localSend?: () => number;
+}): void {
+    try {
+        if (a.body === undefined || a.body === null) return;
+        const capture = a.lane === "side" ? undefined : captures.getStore();
+        let send: number | undefined;
+        if (capture !== undefined) send = capture.fishSends = (capture.fishSends ?? 0) + 1;
+        else send = a.localSend?.();
+        noteEgress({
+            lane: a.lane,
+            reason: a.reason ?? null,
+            body: a.body,
+            sid: capture?.session.id ?? a.sid,
+            captureId: capture?.requestId,
+            round: capture?.round,
+            fishReq: capture?.fishReq ?? a.fishReq,
+            send,
+            model: a.model,
+            msgs: a.msgs,
+            samePayload: a.samePayload,
+            upstreamHost: upstreamHostOf(a.upstreamUrl),
+        });
+    } catch {
+        // bookkeeping only — never break a send
+    }
+}
 
 /** Covers the entire forward, including awaited streaming/loop callbacks.
  *  Concurrent requests keep independent pending evidence; only settled pairs
@@ -732,7 +787,7 @@ export function generationParamFp(body: Record<string, unknown> | null | undefin
  *  the outbound credential fingerprint (#2131) — likewise inherited from the
  *  prior slot on a byte-identical re-note without a fresh capture. `effFp` is
  *  the generation-parameter fingerprint (#3803) — same inheritance rule. */
-export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string, effFp?: string): void {
+export function noteForwardedBody(session: Session, body: string, msgs?: number | null, keyFp?: string, effFp?: string): boolean {
     // #2868: encode to UTF-8 ONCE here — digest, capped head and retained full
     // body all consume this same buffer, so no later comparison re-encodes.
     // Caps are BYTES (the old code-unit caps overshot them up to 3× on CJK).
@@ -766,6 +821,8 @@ export function noteForwardedBody(session: Session, body: string, msgs?: number 
     // prepare may reuse a measured baseline; this new payload is not measured yet.
     if (session.stats.contextTokensSource !== undefined) recordContextObservation(session, session.stats.contextTokens, "estimate");
     else delete session.metadata?.publicContextObservation;
+    // fish-ledger P0: the same byte-identity verdict, handed to the egress row.
+    return samePayload;
 }
 
 // #1843 L1: learned per-route image cost. The prior (pixel tile model or bytes)
@@ -821,6 +878,20 @@ export function noteForwardedImageFacts(session: Session, facts: ForwardedImageF
     const capture = captures.getStore();
     if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
+}
+
+// fork（M6）：recordEstimate 用的只读取数。不消耗任何东西。
+const lastOutboundImageTokens = new WeakMap<Session, number>();
+function usageEstimateFactsFor(session: Session): UsageEstimateFacts {
+    const capture = captures.getStore();
+    const facts = capture?.session === session ? capture.imageFacts : imageFactsLastSent.get(session);
+    return {
+        text: session.stats.lastLocalTextEstimate ?? null,
+        images: facts?.nImages ?? null,
+        imageTokens: lastOutboundImageTokens.get(session) ?? null,
+        textSide: facts?.textSide ?? null,
+        k: session.stats.calibratedEstimate ?? null,
+    };
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
@@ -1839,6 +1910,8 @@ export function noteOutboundContextEstimates(
     session: Session,
     est: { upperBound: number; scaledText: number; imageTokens: number; calibrated: boolean },
 ): void {
+    // fork（M6）：recordEstimate 开着时记下这一份外发的图片 token 估计（只在内存里）。
+    if (fishLedgerRecordEstimateOn()) lastOutboundImageTokens.set(session, est.imageTokens);
     session.stats.localInputEstimate = est.upperBound;
     session.stats.contextEstimateTokens = Math.round(est.scaledText + est.imageTokens);
     session.stats.contextEstimateCalibrated = est.calibrated;
@@ -1850,7 +1923,13 @@ export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
+    /** fish-ledger P0: which lane settled this report (the loop passes "loop"). */
+    ledgerLane: "main" | "loop" = "main",
 ): void {
+    // fork（M6）：在配对的估计、图片事实被这次结算消耗之前取一份（只在 recordEstimate 开着时）。
+    const ledgerEst = fishLedgerRecordEstimateOn() ? usageEstimateFactsFor(session) : undefined;
+    // fork（日期，D4）：回复结算的时刻（只在 fish.dateNotes.recordOccurrence 开着时记，只在内存里）
+    if (fishOccRecordOn()) fishOccResponseEnd(session.id);
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
@@ -2033,6 +2112,30 @@ export function settleUsageReport(
     if (seamBody !== undefined && seamIn !== undefined && !backwards) settled.settledInBody = seamIn;
     else delete settled.settledInBody;
     delete pending.inBody;
+    // fish-ledger P0 (usage, layer provider): one row per settled report, after
+    // detectSeam so the line's fold/seam stamps are final. Never throws.
+    try {
+        const own = capture?.session === session ? capture : undefined;
+        noteUsage({
+            lane: ledgerLane,
+            sid: session.id,
+            captureId: own?.requestId,
+            round: own?.round,
+            fishReq: own?.fishReq,
+            model: typeof sample?.model === "string" ? sample.model : (typeof session.metadata?.lastModel === "string" ? session.metadata.lastModel : undefined),
+            protocol: s.protocol,
+            upstreamHost: upstreamHostOf(s.upstream),
+            total: s.total,
+            cached: s.reportedCached,
+            creation: typeof s.creation === "number" ? s.creation : null,
+            output: s.output,
+            fold: sample?.foldSeq ?? null,
+            seam: sample?.seam ?? null,
+            ...(ledgerEst !== undefined ? { est: ledgerEst } : {}),
+        });
+    } catch {
+        // bookkeeping only
+    }
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).

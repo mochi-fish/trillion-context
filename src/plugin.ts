@@ -11,7 +11,7 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSessionAsync, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, noteAbortedTurn, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI, withSearchAroundParam } from "./compress-tool.js";
 import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -35,6 +35,8 @@ import { captureHandoffJson, HANDOFF_REPLY_MAX_BYTES } from "./server/handoff-re
 export interface UpstreamMeta {
     status?: number;
     contentType?: string;
+    /** Only supplied for a stream whose originating Anthropic response is known. */
+    requestId?: string;
 }
 
 /** #2328 Q4: does the dangling partial event left at a cut carry the opening
@@ -74,6 +76,7 @@ import { lookupToolUseIdSession, lookupToolWitness, recordToolUseId, recordToolW
 import { awaitDrain } from "./server/stream-io.js";
 import { incomingCoreMessages } from "./fork-adoption.js";
 import { BUILD_COMMIT } from "./version.js";
+import { FISH_REQUEST_CAPABILITY, FISH_REQUEST_HEADER } from "./fish-request.js";
 import { isExternalSummaryBlock } from "./external-summary-marker.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -915,7 +918,7 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
-export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts): void {
+export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config, toolPrompts?: ToolPrompts, searchAround = false): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
     // proxy's config leaves disabled guarantees a rejected call the moment the
@@ -962,13 +965,16 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // harness will reject nor dodges the direct call native hosts expect.
     // #3243: the pack surface's tool descriptions (toolPrompts) override the
     // stock descriptions where a promptPack declares its own.
-    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
-    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
+    // fork search v2 (11-20): search_context's optional `around` only while the
+    // BASE config enables it (searchAround); off ⇒ the arrays are the originals.
+    const aroundOf = <T extends Parameters<typeof withSearchAroundParam>[0][number]>(tools: readonly T[]): readonly T[] => (searchAround ? withSearchAroundParam(tools) : tools);
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(aroundOf(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE), toolPrompts), externalSummary), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(aroundOf(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE), toolPrompts), externalSummary), "binding");
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(aroundOf(BILI_ACP_TOOLS_RESPONSES_NO_RANGE), toolPrompts), externalSummary), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -989,7 +995,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         // #2652: maxToolDurationMs = the budget's totalTimeoutMs ceiling, so agent-side
         // bridges size their compress-call HTTP wait to the real server bound instead of a
         // fixed constant. Absent when the chain is off (classic summaries commit locally).
-        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
+        // fish-ledger P0: this build strips the request-id header at egress
+        // (UPSTREAM_HOP_HEADERS) and files it in the local ledger, so clients
+        // may stamp it on the loopback hop. Declaration only — the tools above
+        // are byte-identical with or without it.
+        capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint", maxToolDurationMs: externalSummaryMaxToolDurationMs(config) } } : {}), fork: { protocolVersion: 2, acceptsProtocolVersions: [1, 2], endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" }, fishLedger: { features: [FISH_REQUEST_CAPABILITY], header: FISH_REQUEST_HEADER } },
     }));
 }
 
@@ -1004,6 +1014,8 @@ export type PluginToolDeps = {
     // the status panel appends " · inline" so a screenshot names its mode.
     inlineLane?: boolean;
     signal?: AbortSignal;
+    /** fork search v2 (11-20): the BASE config's compress.search (around gate). */
+    searchLane?: import("./search-v2.js").SearchLane;
 };
 
 /** Reverse-lookup the conversation id bound to a session id. #656: the
@@ -2307,6 +2319,7 @@ export async function handlePluginTool(
                 compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
+                ...(deps.searchLane ? { searchLane: deps.searchLane } : {}),
             }, callId, undefined, deps.signal);
             if (nativeCaller && tool === retrieveToolName(session) && typeof args.ref === "string") {
                 // Preserve the session's export before a same-ref concurrent lookup.
@@ -3611,6 +3624,9 @@ export async function pipePluginChatWithStrip(
                     if (ev["type"] === "message_delta") {
                         const d = ev["delta"] as Record<string, unknown> | undefined;
                         if (d && typeof d["stop_reason"] === "string") finalFinishReason = d["stop_reason"] as string;
+                        if (protocol === "anthropic" && d?.stop_reason === "refusal" && upstreamMeta?.requestId && !degenerateRetried && !truncationRetried) {
+                            log?.(`[plugin] Anthropic stop_reason=refusal request-id=${upstreamMeta.requestId}`);
+                        }
                     }
                     // Each wire declares its terminal on its own event: anthropic on
                     // message_delta's stop_reason, openai on the finish_reason chunk

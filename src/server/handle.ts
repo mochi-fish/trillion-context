@@ -7,7 +7,9 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
+import { computeInputJudgeBase, resolveModelWindowEntry, stepSwitchTruncateHold, type SwitchHoldState } from "../model-windows.js";
+import { setFishLedgerRecordEstimate } from "../fish-ledger.js";
+import { applySessionCompressOverride, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, resolveSessionCompressOverride, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
@@ -23,6 +25,8 @@ import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire,
 import { acquireInFlight, getSessionAsync, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
+import { storeEffectiveSearchV2 } from "../search-v2.js";
+import { resolveSearchV2Settings, searchV2RawUsable, type SearchV2Settings } from "../search-cjk/settings.js";
 import { externalSummaryEnabled, messageTimestampSections } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
@@ -110,6 +114,20 @@ function earlyHoldCredHeaders(req: http.IncomingMessage): Record<string, string>
 // #5243: warn-once per model when the live codex model table is unavailable and
 // window sizing falls back to config.toml model_context_window.
 const codexConfigWindowWarned = new Set<string>();
+
+// fork: one [session-override] line per session|resolved-window.
+const sessionOverrideLogged = new Set<string>();
+// fork（多模型，M5）：一行 [model-window] / 一次退回 window 的 warn。
+const modelWindowLogged = new Set<string>();
+const inputJudgeFallbackWarned = new Set<string>();
+// fork: one "no entry matches" warn per plugin-lane session id.
+const sessionOverrideUnmatchedWarned = new Set<string>();
+// fork search v2 (11-20): one warn per process for a broken compress.search block.
+let searchV2BadBlockWarned = false;
+function hasSessionTable(compress: CompressSettings | undefined): boolean {
+    const t = (compress as { sessions?: unknown } | undefined)?.sessions;
+    return !!t && typeof t === "object" && !Array.isArray(t) && Object.keys(t).length > 0;
+}
 
 // #2986: the derivedFromSessionId link is what keeps a kind child session
 // reachable along its parent chain after a restart — without it the shared
@@ -720,7 +738,11 @@ async function handleRequest(
     // it — threaded into preflightCompressIfNeeded so a fail-fast can tell the
     // operator that their own setting, not the upstream, is the wall they hit.
     let resolvedNativeWindow: number | undefined;
-    let windowShrinkReason: "operator" | "codex" | undefined;
+    let windowShrinkReason: "operator" | "session" | "codex" | undefined;
+    // fork（多模型）：会话条目里的 limitMode（M5）和 truncateHoldAfterSwitch（R4）。
+    // 没写 = undefined = 和上游一样。
+    let sessionLimitMode: "window" | "input" | undefined;
+    let sessionSwitchHold: number | undefined;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -744,6 +766,8 @@ async function handleRequest(
     // level merge); stamped onto the session below like the other per-request
     // policies. Off unless compress.search.planAware=true at some level.
     let resolvedSearchPlanAware = false;
+    // fork search v2 (11-20): resolved only while the merged config says engine = "cjk".
+    let resolvedSearchV2: SearchV2Settings | undefined;
     let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
         // Gemini's model lives in the request path, every other wire carries it
@@ -908,6 +932,14 @@ async function handleRequest(
             // some config level, after local verification.
             resolvedCcrCfg = compressCfg.ccr;
             resolvedSearchPlanAware = compressCfg.search?.planAware === true;
+            resolvedSearchV2 = undefined;
+            if (compressCfg.search?.engine === "cjk") {
+                if (searchV2RawUsable(compressCfg.search)) resolvedSearchV2 = resolveSearchV2Settings(compressCfg.search, model);
+                else if (!searchV2BadBlockWarned) {
+                    searchV2BadBlockWarned = true;
+                    loggerLog("warn", "[search-v2] compress.search has a v2 field with the wrong type or a regex that does not compile — the cjk engine stays off (search_context uses the old path) until the block is fixed");
+                }
+            }
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
             reqSurface = surfaceRes.surface;
@@ -1592,6 +1624,46 @@ async function handleRequest(
         // be able to reload from the DB instead of starting a fresh session.
         const session = await getSessionAsync(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? `prefix-affinity ${anonAffinity.tailHash.slice(0, 8)}` : undefined) });
         memProbe(opts.debug, log, sessionId, "inbound-parsed", bodyBuffer.length);
+        // fork: per-session override (compress.sessions) — the highest-priority
+        // window source, above the global/provider/model cascade resolved
+        // before the session was bound. Matched by the bound proxy session id
+        // first, then this request's plugin conversation header (the dsh lane
+        // stamps its own session id there). No entry → reqConfig untouched.
+        // fork（多模型，M6）：证据账的 recordEstimate 每份请求现读（reload 后马上生效）。
+        setFishLedgerRecordEstimate(opts.fishLedger?.recordEstimate === true);
+        {
+            const sessionOverride = resolveSessionCompressOverride(opts.compress, [session.id, pluginConversationHeader(req.headers)]);
+            if (sessionOverride !== undefined) {
+                const { noGhostwrite, foldHostFileImages, epochMajorityGuard, requireUsageSampleForTruncate, foldHostFileImagePaths, anthropicThinkingBinding, openaiReasoningAliases } = sessionOverride.override;
+                reqConfig = applySessionCompressOverride(reqConfig, { noGhostwrite, foldHostFileImages, epochMajorityGuard, requireUsageSampleForTruncate, foldHostFileImagePaths, anthropicThinkingBinding, openaiReasoningAliases }, resolvedNativeWindow ?? config.modelContextLimit);
+                // fork（多模型）：M5 判窗方式、R4 切模型后按住截断的份数——在下面判窗那一段用。
+                sessionLimitMode = sessionOverride.override.limitMode;
+                sessionSwitchHold = sessionOverride.override.truncateHoldAfterSwitch;
+            } else if (pluginAgent !== undefined && hasSessionTable(opts.compress) && !sessionOverrideUnmatchedWarned.has(session.id)) {
+                // fork: a plugin-lane session the table does not name. After a
+                // rotation / fork-adoption / crash restart the conversation gets a
+                // NEW id and its entry silently stops applying (window back to the
+                // cascade, noGhostwrite back off) — say so once per session id so
+                // the gap is visible in the log.
+                sessionOverrideUnmatchedWarned.add(session.id);
+                log("warn", `[window] [session-override] ${session.id}: no compress.sessions entry matches this plugin-lane session (conversation header ${pluginConversationHeader(req.headers) ?? "none"}) — the three-level compress settings apply; if this conversation was rotated or forked, move its entry to the new id`);
+            }
+            if (sessionOverride?.override.modelContextLimit !== undefined) {
+                const before = reqConfig.modelContextLimit;
+                const sessionNative = resolvedNativeWindow ?? config.modelContextLimit;
+                reqConfig = applySessionCompressOverride(reqConfig, { modelContextLimit: sessionOverride.override.modelContextLimit }, sessionNative);
+                // Operator-owned, exactly like compress.modelContextLimit: never
+                // floored as a low-confidence fallback, and a fail-fast names
+                // the operator setting as the wall when it sits below native.
+                nativeFromFallback = false;
+                windowShrinkReason = resolvedNativeWindow !== undefined && reqConfig.modelContextLimit < resolvedNativeWindow ? "session" : undefined;
+                const logKey = `${session.id}|${reqConfig.modelContextLimit}`;
+                if (!sessionOverrideLogged.has(logKey)) {
+                    sessionOverrideLogged.add(logKey);
+                    log("info", `[window] [session-override] ${session.id}: compress.sessions["${sessionOverride.key}"].modelContextLimit=${String(sessionOverride.override.modelContextLimit)} → ${reqConfig.modelContextLimit} (cascade gave ${before}, native ${resolvedNativeWindow ?? "none"})`);
+                }
+            }
+        }
         // #5490: the first-sight warn above needs no session identity; this one
         // does — recurrence across DISTINCT sessions is what turns "a model I
         // haven't declared" into "an alias this host resolves internally that
@@ -2102,6 +2174,7 @@ async function handleRequest(
         // whichever mode served this session and the re-rank is pure output-
         // side policy on its result — both proxy and plugin lanes apply it.
         storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
+        storeEffectiveSearchV2(session, resolvedSearchV2);
         // #1897: omp-style hosts register bili's ACP tools as first-class extension
         // tools and include them in EVERY model request — including side requests
         // (title-gen), which carry no host action tools of their own. omp titles with
@@ -2482,7 +2555,12 @@ async function handleRequest(
             headroomOrigin,
             (parsed as { model?: string }).model,
         );
-        if (shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0) {
+        // fork（多模型，M5）：limitMode "input" 也走进这一段（要同一套 max output 的认法），
+        // 但判窗按 models.md 2.3 直接算；原生窗口拿不到时退回 window 的算法。
+        const windowModeReserves = shouldReserveOutputHeadroom(protocol, headroomOrigin, requestModel) || provenReserve > 0;
+        const inputLimitMode = sessionLimitMode === "input";
+        let windowChangedThisRequest = false;
+        if (windowModeReserves || inputLimitMode) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             let maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -2574,6 +2652,7 @@ async function handleRequest(
                 const curRes = { m: reqModelId ?? "?", s: wsSourceForLog ?? "?", b: reqConfig.modelContextLimit };
                 const prevRes = session.metadata?.lastWindowResolution as { m: string; s: string; b: number } | undefined;
                 if (prevRes !== undefined && (prevRes.m !== curRes.m || prevRes.s !== curRes.s || prevRes.b !== curRes.b)) {
+                    windowChangedThisRequest = true;
                     // #5490: landing mid-session on the ANONYMOUS DEFAULT (the new
                     // model resolved to nothing) is the dangerous shape — a long
                     // conversation suddenly judged against a guessed base, which
@@ -2585,20 +2664,50 @@ async function handleRequest(
                 }
                 if (session.metadata) session.metadata.lastWindowResolution = curRes;
             }
-            let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap);
+            // fork（多模型，M5）：input 模式。judgeBase 直接当成扣过预留的判窗；
+            // max_tokens 的夹紧照旧守原生窗口（不在这里）。
+            const modelWindowRow = inputLimitMode ? resolveModelWindowEntry(opts.compress, reqModelId ?? (typeof requestModel === "string" ? requestModel : undefined)) : undefined;
+            const inputJudge = inputLimitMode
+                ? computeInputJudgeBase({
+                    target: reqConfig.modelContextLimit,
+                    hostNative: nativeFromFallback ? undefined : resolvedNativeWindow,
+                    maxOutput,
+                    entry: modelWindowRow?.entry,
+                    provenReserve,
+                })
+                : undefined;
+            if (inputLimitMode && inputJudge === undefined && !inputJudgeFallbackWarned.has(session.id)) {
+                inputJudgeFallbackWarned.add(session.id);
+                log("warn", `[${session.id}] [model-window] limitMode "input" but model=${String(reqModelId ?? requestModel ?? "?")} has no authoritative native window (${nativeFromFallback ? "fallback guess" : "none reported"}) — judging with the "window" rules this request`);
+            }
+            let reserved = inputJudge !== undefined ? inputJudge.judgeBase : windowModeReserves ? reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput, headroomCap) : reqConfig.modelContextLimit;
+            if (inputJudge !== undefined) {
+                session.metadata.modelWindow = { limitMode: "input", judgeBase: inputJudge.judgeBase, native: inputJudge.native, safety: inputJudge.safety, quality: inputJudge.quality ?? null, reserve: inputJudge.reserve, target: reqConfig.modelContextLimit, row: modelWindowRow?.key ?? null };
+                const mwModel = String(reqModelId ?? requestModel ?? "?");
+                const mwKey = `${session.id}|${mwModel}|${inputJudge.judgeBase}`;
+                if (!modelWindowLogged.has(mwKey)) {
+                    modelWindowLogged.add(mwKey);
+                    log("info", `[${session.id}] [model-window] model=${mwModel} native=${inputJudge.native} safety=${inputJudge.safety} reserve=${inputJudge.reserve} quality=${inputJudge.quality ?? "none"} target=${reqConfig.modelContextLimit} judgeBase=${inputJudge.judgeBase} row=${modelWindowRow?.key ?? "none"} (limitMode input; floor(native*safety)-reserve=${inputJudge.headroomBound})`);
+                }
+            } else if (session.metadata.modelWindow !== undefined) {
+                // not judged by input this request (limitMode back to window,
+                // removed, or no authoritative native window): drop the stale
+                // record so the metadata matches a session that never had it
+                delete session.metadata.modelWindow;
+            }
             // Fallback-derived windows are optimistic guesses: never let the
             // output-headroom reservation push the effective window below the
             // floor (issue #282: 128k table − 64k max_tokens → 64k effective
             // for a 1M-window model). If the real window is smaller, the first
             // upstream overflow self-heals it.
-            if (nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
+            if (inputJudge === undefined && windowModeReserves && nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
                 log("info", `[${session.id}] fallback context window floored: ${reserved} → ${FALLBACK_EFFECTIVE_WINDOW_FLOOR} (model=${String(requestModel ?? "?")} not authoritatively identified; self-heal corrects it if the real window is smaller)`);
                 reserved = FALLBACK_EFFECTIVE_WINDOW_FLOOR;
             }
             // The #896 cap bounds GUESSED budgets; a proven share is measured —
             // the upstream already counted it in a rejection on this origin+model —
             // so the window may never stay above (declared window − proven share).
-            if (provenReserve > 0 && nativeWindow > provenReserve) {
+            if (inputJudge === undefined && provenReserve > 0 && nativeWindow > provenReserve) {
                 const provenWindow = nativeWindow - provenReserve;
                 if (provenWindow < reserved) reserved = provenWindow;
             }
@@ -2610,7 +2719,7 @@ async function handleRequest(
                 // native-window guarantee is stated here so the two windows
                 // can't be read as one in an incident log.
                 const headroomModel = String(requestModel ?? "?");
-                if (!headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
+                if (inputJudge === undefined && !headroomEffectiveLogged.has(`${headroomModel}|${reserved}`)) {
                     headroomEffectiveLogged.add(`${headroomModel}|${reserved}`);
                     log("info", `[headroom] model=${headroomModel}: effective window ${nativeWindow} -> ${reserved} (reserved ${nativeWindow - reserved} for max output ${maxOutput}, cap ${headroomCap} via compress.outputHeadroomMaxPct) — nudge/preflight judge input against ${reserved}; the outgoing max_tokens clamp still guards the full ${nativeWindow}; a session overflow arm can judge even lower ([arm-judge]) (#2096, #3837, #5191)`);
                 }
@@ -2630,6 +2739,33 @@ async function handleRequest(
         // #955 runtime-info: record the model id + window source for this
         // session so /__bili/plugin/status can show them pre-first-request and
         // post-hoc forensics can tell which source sized the window.
+        // fork（多模型，R4）：换模型 / 换路线以后头 N 份请求只催压、不新做紧急截断。
+        // 上一份的 model 取 lastModel（就在下面改写之前），读数的路线取
+        // stats.lastInputTokensOrigin。没写 truncateHoldAfterSwitch = 不进这里。
+        if (sessionSwitchHold !== undefined && sessionSwitchHold > 0) {
+            const prevHold = session.metadata.truncateHoldAfterSwitch as SwitchHoldState | undefined;
+            const prevModelForHold = typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined;
+            const step = stepSwitchTruncateHold({
+                holdN: sessionSwitchHold,
+                prev: prevHold !== undefined && prevHold !== null && typeof prevHold === "object" ? prevHold : undefined,
+                prevModel: prevModelForHold,
+                curModel: reqModelId,
+                prevOrigin: normalizeUpstreamOrigin(session.stats.lastInputTokensOrigin),
+                curOrigin: headroomOrigin,
+                windowChanged: windowChangedThisRequest,
+                now: Date.now(),
+            });
+            if (step.state !== undefined) session.metadata.truncateHoldAfterSwitch = step.state;
+            else if (session.metadata.truncateHoldAfterSwitch !== undefined) delete session.metadata.truncateHoldAfterSwitch;
+            if (step.hold) {
+                reqConfig = { ...reqConfig, truncate: { ...reqConfig.truncate, holdFreshCuts: true } as Config["truncate"] & { holdFreshCuts?: boolean } };
+                log("info", `[${session.id}] [switch-hold] ${step.started ? `model/route switch (${prevModelForHold ?? "?"} -> ${reqModelId ?? "?"}) — ` : ""}emergency truncation held this request (nudges still injected; latched clips still replay); ${step.state?.left ?? 0} more request(s) held`);
+            }
+        } else if (session.metadata.truncateHoldAfterSwitch !== undefined) {
+            // R4 turned off (or 0): a hold left from when it was on must not
+            // hold an unswitched request after it is turned on again
+            delete session.metadata.truncateHoldAfterSwitch;
+        }
         if (reqModelId !== undefined) session.metadata.lastModel = reqModelId;
         session.metadata.lastWindowSource = wsSourceForLog ?? null;
         // #833: remember the FINAL resolved Config (post self-heal + headroom,

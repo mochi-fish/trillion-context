@@ -418,10 +418,11 @@ function toTokenNumber(s: string): number | undefined {
 //         bodies with HTML-style escapes, so the wire form of ">" is "\u003e"
 //         (#4124 field log); both spellings must match. $1 = the request's own
 //         count (cross-check only), $2 = the cap.
-//   generic: "At most N image(s) may be provided" — cap only.
+//   generic: "At most N image(s) may be provided" — cap only. fork（多模型）：vLLM 的原句真的
+//         写成「image(s)」（带括号）；#4124 的正则原来只认 image / images，撞墙学不到。
 const IMAGE_COUNT_OVERFLOW_PATTERNS: RegExp[] = [
     /too many images in request:\s*(\d+)\s*(?:>|\\u003e)\s*(\d+)/i,
-    /at most\s+(\d+)\s+images?\s+may be provided/i,
+    /at most\s+(\d+)\s+images?(?:\(s\))?\s+may be provided/i,
 ];
 
 /** #4124: extract the per-prompt image-count cap (+ the request's own count,

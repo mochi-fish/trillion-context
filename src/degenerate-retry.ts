@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { noteFishEgress } from "./cache-ledger.js";
 import { beginProvisionalUpstreamThrottle429, noteUpstreamThrottleResolved, releaseUpstreamThrottleProbe, requestModelFromBody, reserveUpstreamThrottleClassification, throttle429ModelScope, upstreamThrottleGate, type ThrottleClassificationReservation } from "./upstream-throttle.js";
 import { hasCompactionTrigger } from "./codex-compact.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -160,6 +161,8 @@ export function makeContinuationRefetch(opts: ContinuationRetryOpts): () => Prom
                 opts.log("info", `[${opts.label}] [plugin] degenerate-terminal retry answered locally by the 429 hold (#4204) — passing the empty turn through`);
                 return null;
             }
+            // fish-ledger P0: same-request re-send with a continuation nudge.
+            noteFishEgress({ lane: "resend", reason: "degenerate-retry", body: wireRetryBody, upstreamUrl: opts.upstreamUrl, model: requestModel });
             const r = await fetchWithTimeout(
                 opts.upstreamUrl,
                 {

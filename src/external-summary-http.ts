@@ -3,6 +3,8 @@ import { summaryAbortSource } from "./external-summary.js";
 import { defaultCountTokens } from "acp-kernel";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, type UpstreamFailureKind } from "./upstream-fail.js";
 import { fetchWithTimeout, isTransientUpstreamError, sleep } from "./fetch-util.js";
+import { noteFishEgress } from "./cache-ledger.js";
+import { noteSideUsage } from "./fish-ledger-usage.js";
 import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
 import { log as loggerLog } from "./logger.js";
 import { maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -268,6 +270,8 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                 signal.throwIfAborted();
                 let dispatched;
                 try {
+                    // fish-ledger P0 (egress, lane side): the external summarizer call.
+                    noteFishEgress({ lane: "side", reason: "external-summary", body, upstreamUrl: plan.url, model: plan.model, sid: typeof plan.sessionId === "string" ? plan.sessionId : undefined });
                     dispatched = await fetchWithTimeout(plan.url, {
                         method: "POST", headers: plan.headers, body, redirect: "manual", dispatcher: proxyDispatcher(plan.proxyUrl),
                     }, undefined, signal);
@@ -301,7 +305,10 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                         }
                         throw new Error(`External summary upstream rejected the request with HTTP ${dispatched.response.status}`);
                     }
-                    const result = parseSummary(plan.protocol, await readResponse(dispatched.response, maxResponseBytes));
+                    const responseText = await readResponse(dispatched.response, maxResponseBytes);
+                    // fish-ledger P0 (usage, lane side): the summarizer call's own usage.
+                    noteSideUsage({ protocol: plan.protocol, text: responseText, sid: typeof plan.sessionId === "string" ? plan.sessionId : undefined, upstreamUrl: plan.url, model: plan.model });
+                    const result = parseSummary(plan.protocol, responseText);
                     signal.throwIfAborted();
                     return result;
                 } finally {

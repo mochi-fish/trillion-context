@@ -5,9 +5,10 @@ import { configuredSummaryPlan } from "./external-summary-runtime.js";
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { applyRanges, noVisibleContextRefusal, normalizeRangeOrder, recoverEvictedView, supersededRefRejection, type RewriteCtx } from "./stream.js";
 import { compressResult, type ProxyToolResult } from "./proxy-tool-result.js";
-import { imagePlaceholders } from "./image-note.js";
+import { imageNoteOptions, imagePlaceholders } from "./image-note.js";
 import { describeExternalSummaryFailure, summaryLengthBudgetClause, type SummaryWork } from "./external-summary.js";
 import { newExternalCallId } from "./external-summary-marker.js";
+import { noGhostwriteOn, noteGhostwriteBlocked } from "./no-ghostwrite.js";
 
 // Re-exported for callers that historically imported it here; the canonical
 // home is the leaf module (kept import-graph-light for display surfaces).
@@ -42,6 +43,15 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     try { plan = configuredSummaryPlan((ctx.config as ResolvedKernelConfig).externalSummary, ctx.session.id); }
     catch { return compressResult("[Compression FAILED: external summary configuration is invalid. Nothing compressed.]", "refused", 0); }
     if (!plan) return applyRanges(parseCompressInput(input, callId), ctx);
+    // fork: no-ghostwrite — the configured chain would write (or overwrite) the
+    // summary on the model's behalf. Count it and commit ONLY what the model
+    // itself wrote: a range without a summary fails the ordinary parse and is
+    // refused, exactly as with no chain configured.
+    if (noGhostwriteOn(ctx.config)) {
+        const counts = noteGhostwriteBlocked(ctx.session, "externalSummary");
+        ctx.log(`[acp-proxy] [no-ghostwrite] ${ctx.session.id}: external summary chain NOT used for this compress — the model's own summaries only (externalSummary blocked ${counts.externalSummary}×)`);
+        return applyRanges(parseCompressInput(input, callId), ctx);
+    }
     const parsed = parseCompressInput(withOptionalSummaries(input), callId);
     if (parsed.ranges.length === 0) return applyRanges(parsed, ctx);
     normalizeRangeOrder(parsed.ranges);
@@ -58,8 +68,9 @@ export async function applyConfiguredCompression(input: unknown, ctx: RewriteCtx
     if (resolved.rejection !== null) return applyRanges({ ...parsed, ranges: resolved.translatedRanges }, ctx);
     const state = ctx.session.state;
     const revision = ctx.session.revisionEpoch;
+    const noteOpts = imageNoteOptions(ctx.config);
     const messages = (ctx.compressMessages ?? ctx.messages).map((message) => {
-        const notes = imagePlaceholders(message);
+        const notes = imagePlaceholders(message, noteOpts);
         return notes.length > 0 ? { ...message, text: `${message.text ?? ""}\n${notes.join(" ")}` } : message;
     });
     const work: SummaryWork[] = [];

@@ -19,3 +19,9 @@ tests/golden/web-hitrate/*.svg text eol=lf
 # "every fixture artifact matches its recorded digest and size" failed every
 # windows-latest leg (run 38982246862).
 tests/fixtures/vertex-anthropic/* text eol=lf
+
+# fork（日期，D2）：src/fish/reldate.mjs 是 fish-dsh sessionless/reldate/reldate.mjs 的逐字节拷贝，
+# 运行时核 sha256（src/fish/reldate-load.ts）；共用用例也逐字节。任何平台都不许换行转换。
+src/fish/reldate.mjs -text
+src/fish/reldate.sha256 -text
+tests/fixtures/reldate-cases.json -text

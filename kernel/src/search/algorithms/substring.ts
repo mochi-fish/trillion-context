@@ -1,5 +1,5 @@
 import type { SearchAlgorithm, SearchDoc, ScoredBlock } from "../types.js";
-import { docFeatures } from "../doc-cache.js";
+import { docLower } from "../doc-cache.js";
 
 /**
  * Substring counting — the original baseline algorithm.
@@ -19,7 +19,7 @@ export const substringAlgorithm: SearchAlgorithm = {
       .filter((t) => t.length > 0);
     if (terms.length === 0) return docs.map((d) => ({ ref: d.ref, score: 0 }));
     return docs.map((d) => {
-      const haystack = docFeatures(d.text).lower; // memoized across calls
+      const haystack = docLower(d.text); // memoized across calls (lower-cased text only, fork S0)
       let score = 0;
       for (const term of terms) score += countOccurrences(haystack, term);
       return { ref: d.ref, score };

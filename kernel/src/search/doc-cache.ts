@@ -85,10 +85,45 @@ export function docFeatures(text: string): DocFeatures {
   return f;
 }
 
+// fork S0 (11-20): the substring channel only ever needs `lower`, yet going
+// through docFeatures() built the whole feature set (segmenter tf + bigram
+// set) for every doc — on a corpus above the 8M cap that meant re-tokenizing
+// the excess on EVERY search_context call (≈2–3 s of synchronous work on a
+// 10M-char session). The lower-cased string gets its own LRU, sized for a
+// whole single-session corpus: the value is exactly `text.toLowerCase()`, so
+// substring scores are bit-identical to the docFeatures path. Cleared by
+// clearDocFeatures() together with the feature cache.
+const LOWER_CAP_CHARS = 16 * 1024 * 1024;
+const lowerCache = new Map<string, string>();
+let lowerChars = 0;
+
+/** Lower-cased doc text, memoized across calls (substring channel). */
+export function docLower(text: string): string {
+  const hit = lowerCache.get(text);
+  if (hit !== undefined) {
+    lowerCache.delete(text);
+    lowerCache.set(text, hit);
+    return hit;
+  }
+  const lower = text.toLowerCase();
+  if (text.length > 0 && text.length <= LOWER_CAP_CHARS) {
+    while (lowerChars + text.length > LOWER_CAP_CHARS && lowerCache.size > 0) {
+      const k = lowerCache.keys().next().value as string;
+      lowerChars -= k.length;
+      lowerCache.delete(k);
+    }
+    lowerCache.set(text, lower);
+    lowerChars += text.length;
+  }
+  return lower;
+}
+
 /** Drop all cached features (e.g. on session shutdown/switch). */
 export function clearDocFeatures(): void {
   cache.clear();
   cachedChars = 0;
+  lowerCache.clear();
+  lowerChars = 0;
 }
 
 /**

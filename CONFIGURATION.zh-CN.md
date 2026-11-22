@@ -263,6 +263,14 @@
 | `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex 的压缩请求（intercept，默认）还是转给上游（pass）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测，#3008）—— 用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。 |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
+| `fishLedger.recordEstimate` | boolean | false (unset) | — | fork（多模型）：开着而且证据账（fish-ledger）的代理写入方开着时，provider 那一层的每条 usage 行多带一个 data.est——只有数：这份请求的本地文字估计、外发图的张数和图的 token、文字侧估计（消息加线上开销）、这次结算之前的 k̂——给离线拟合按模型的加性校准用。别的都不变。POST /__bili/config/reload 或设置页保存（PUT /__bili/config）后当场生效。false / 不写 = 不多这个键。 |
+| `fish.dateNotes.enabled` | boolean | false (unset) | — | fork（日期）：开着时，翻旧话的工具结果——search_context 的摘录和 around（cjk 引擎）、整块 decompress（inline、临时文件、toFile）——在相对日期的说法后面补一个算好的日期（「下周三（=2026-11-25 周三）」），每条原话按它真正说出的那一刻算（先查发生时刻旁路表，再用内核第一次看到的时刻夹出区间）。只标对话（不标思考、工具回执、网页、工具翻出来的聊天记录）；引号里的、转述的、假设的、0–5 点说的「明天」不标；有注记的结果结尾（文件是开头）多一行图例。不碰内核渲染、存下的消息和发给上游的任何东西。规则在 src/fish/reldate.mjs（逐字节拷贝，载入时核 sha256，对不上整条不启用）。false / 不写 = 工具结果和没有这一项时逐字节一样。POST /__bili/config/reload 或设置页保存后生效。fish 块里有一个认不出的键或不对的值，整块当没写（全关，记一行 warn）。 |
+| `fish.dateNotes.summaries` | boolean | false | — | fork（日期）：search_context 列出的她自己写的块摘要也标，锚点是这一块覆盖的那段时间（跨日不标）。缺省关：摘要可能是几天后才写的。 |
+| `fish.dateNotes.tzOffsetMin` | number | 540 | — | fork（日期）：日期注记和发生时刻月份键用的固定当地偏移（分钟，不看进程时区）。整数 −720…840。 |
+| `fish.dateNotes.nightEndHour` | number | 5 | — | fork（日期）：0 点到这个钟点之间说的、要看「今天算哪天」的词（「明天」、周一夜里的「下周一」）不标。整数 0…12。 |
+| `fish.dateNotes.maxPerResult` | number | 24 | — | fork（日期）：一个工具结果里最多标几处。整数 1…200。 |
+| `fish.dateNotes.maxPerSnippet` | number | 3 | — | fork（日期）：search_context 的一段摘录（连同后面那句回话）里最多标几处。整数 1…24。 |
+| `fish.dateNotes.recordOccurrence` | boolean | false | — | fork（日期）：把每条新消息真正发生的时刻记进 session_ext 的 fish:occ:YYYYMM（当地月）——进来的话记第一次看到的时刻，上一段回复记它的用量结算那一刻；一轮新盖章 17 条以上、或回复不在最前面，整轮不记。日期注记读它当最可信的锚点。false / 不写 = 一个 fish:occ:* 键都不写。 |
 
 **压缩（全局层级）**
 
@@ -281,6 +289,17 @@
 | `compress.nudgeDecisionMaxTokens` | number | 200 | — | nudgeModelDecided 所用模型决策 side call 的输出预算（token）。必须 > 0。 |
 | `compress.requireNudge` | boolean | off (unset) | — | 禁止未提示的模型主动压缩（#5683）：只有当前轮次压缩提醒真正送达模型时（advisory、模型自决指令、紧急提醒都算；"gated"/"vetoed"/"skipped" 不算）才允许 compress，否则拒绝并回错误回执；同一轮内的多次 loop 请求保持武装，下一个未提示轮次自动解除。bili 自己的溢出兜底折叠不受影响。针对会自行乱压的模型（如 qwen 27b），可按 provider/model 单独开启。默认关闭。 |
 | `compress.requireRecommendation` | boolean | off (unset) | — | 禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。 |
+| `compress.sessions` | object | unset | — | fork（养成向）：按会话的覆盖，优先级在全局 / 提供方 / 模型三级之上；键是代理的会话 id（DSH 车道就是 DSH 的会话 id）或这次请求的 x-bili-plugin-conversation 头，按字段合并（同一个字段第一个写了的身份赢）；只在全局一级读；只收 modelContextLimit、noGhostwrite、foldHostFileImages、epochMajorityGuard、requireUsageSampleForTruncate、foldHostFileImagePaths，以及只能按会话写的 limitMode、truncateHoldAfterSwitch、anthropicThinkingBinding、openaiReasoningAliases（多模型 fork；不认其中某个键的构建，网页面板会整个 sessions 块不认）。插件车道上一条都没对上的会话打一次 warn（换册、分叉后会话 id 会变）。不写 = 和上游一样。 |
+| `compress.noGhostwrite` | boolean | off (unset) | — | fork（养成向）：「不代写」——代理绝不替模型写摘要：preflight 的模型 / 外部 / 确定性摘要和分层合并、externalSummary 替模型补写、autoFold 都不走。越过配置窗口时：载荷加这次的输出预算放得进模型真实窗口就原样转发；只是输出预算放不进时，把这次的输出预算收小（不低于 4096）再转发；连这样都放不进才回 413。内核的 emergency-truncate 照旧会剪。每次本来要代写、每次收小输出预算都在会话 metadata.noGhostwrite 里记数。 |
+| `compress.foldHostFileImages` | boolean | off (unset) | — | fork（养成向）：Anthropic 线上工具结果里 source.type="file" 的图（原图在宿主那边、file_id 会过期）可以折；顶层的 file 图照旧钉住（身份只靠位置）。file_id 不当成能取回的句柄写进摘要，折叠尾巴写「原图在宿主那边」，decompress 拿不回图，发给上游的只许是这一次请求里的 file_id。也能按会话写（compress.sessions）。以后关掉只停住新的折叠，已经折掉的图不会回来。不开 = 上游的钉住。 |
+| `compress.foldHostFileImagePaths` | boolean | off (unset) | — | fork（养成向）：只在 foldHostFileImages 也开着时起作用。她自己 compress 折掉工具结果里的图时，块尾巴逐张列出宿主附件库里的只读规范化副本路径（~/…/attachments/v1/objects/xx/<sha256>，从宿主每张图前面的 handle 文字里认出来；不写绝对路径、没有系统用户名），她能用 read_image 再读；隐私那几道一律偏严：没有工具名（配对的 tool_use 不在这一次请求里）、屏幕截图（mcp__wincu__ 工具、名字里有 windows_computer_use_ 的工具，或者结果的字里有 wincu 截屏文件名、.dsh-watch-，不管哪个目录）、结果头指向临时目录（不管哪个工具，CRLF 换行的也认）或者路径没法按字面比（8.3 短名、设备或网络路径前缀、点段、某一段以点或空格结尾）、read_image 认不出结果头、附件库以上那几段里有系统用户名（家目录最后一段、os.userInfo().username、USERNAME/USER、USERPROFILE 最后一段）、家目录太浅、副本不在、认不出的，不留路径、照实写原因；一张图的编号在任何一处算截屏、临时目录、没有工具名，别处（同一块、别的块、并块、decompress）出现也不给路径，记在会话 metadata 里（hostImagePathsNoPath，留最新的 1024 个）。base64 的图也列；块里同时有上游那行「restores pixels」（或并进来的子块有过）时，头一句改说带 m 编号的那几张 decompress 也许还取得回、别的拿不回，不再整句说「decompress 拿不回图」。compress 回执附上同一段，并块时把子块的那段带上来（一块最多 16 行），decompress({ imageRef }) 取到宿主的文件图时给路径。已经建好的块、历史消息一律不改。家目录默认 os.homedir()（环境变量 BILI_HOST_HOME 能换）。也能按会话写。不认这个键的旧构建，网页设置面板的严格解析会整个 sessions 块不认——只能在装上认它的构建以后才写。不开 = 只写「原图在宿主那边」。 |
+| `compress.epochMajorityGuard` | boolean | off (unset) | — | fork（养成向）：上游 #5737（v0.1.214，修 #5715）的「活着的多数」判断，默认关：活着的块盖住的硬消息严格过半仍原样在线上时，对账不置「等确认」记号，已经挂着的当场清掉。记号只挡 preflight 代写，所以没开 noGhostwrite 时打开它，越线时代理会恢复代写。也能按会话写。不开 = 0.1.213 的判断。 |
+| `compress.requireUsageSampleForTruncate` | boolean | off (unset) | — | fork（养成向）：紧急截断只认落了账的真用量。这一次判大小用的是本地估计时（上一份请求被掐断、用量没落账，估计值常比真用量大得多），内核的 emergency-truncate 不剪新的：已经锁住的照旧原样重放，新的等下一次真用量回来再判。催压不受影响（催压自己有估计值的等待：requireUsageSampleForPressure）。每次这样没剪都在会话 metadata.truncateHeldForUsage 里记数、日志打一行 [truncate-hold]。上游从不回用量的线路别开（那样就永远不剪了）。映射到内核 truncate.requireUsageSample；也能按会话写。不开 = 上游的截断。 |
+| `compress.modelWindows` | object | unset | — | fork（多模型）：按模型的窗口表，只给 compress.sessions 里写了 limitMode "input" 的会话用；只在全局一级读。键是请求里的 model，或者 "<提供方>/<model>"（请求的 model 先整串认，再按最后一个斜杠后面那段认，只认唯一的一行；两行都对得上就都不用、打一次 warn）。每一行收 window（≥ 1000 的整数：这个模型真正的原生窗口，和宿主报的取小）、safety（0.5–1，缺省 0.85）、quality（≥ 1000 的整数：可选的质量 / 速度上限）。写坏的行请求时不生效、打一次 warn；网页面板的严格解析整块不认。不写 = 空表。 |
+| `compress.sessions.*.limitMode` | string | "window" (unset) | — | fork（多模型），只能按会话写："window" = 和上游一样（原生窗口或 modelContextLimit，再扣输出预留）。"input" = 按「能用的输入」判：judgeBase = min(modelContextLimit, quality, ⌊W × safety⌋ − min(max_tokens, 0.25 × W))，W 是宿主报的原生窗口、再用 modelWindows 那一行的 window 封顶；它直接顶替扣过预留的判窗（max_tokens 的夹紧照旧守 W）。宿主没报原生窗口（只是兜底猜的或没有）时，那一份按 "window" 判、打一次 warn。算出来的数记在会话 metadata.modelWindow，日志打一次 [model-window]。 |
+| `compress.sessions.*.truncateHoldAfterSwitch` | integer | 0 (unset) | — | fork（多模型），只能按会话写，0–8：换模型、换上游路线或出了 [window-change] 以后，接下来 N 份请求（含这一份）内核的 emergency-truncate 不剪新的——已经锁住的照旧原样重放，催压照旧。防的是切换后那一份按上一个模型落账的用量被剪。状态在会话 metadata.truncateHoldAfterSwitch，每份按住的请求打一行 [switch-hold]；对应 fork 内核的 truncate.holdFreshCuts。0 / 不写 = 上游的截断。 |
+| `compress.sessions.*.anthropicThinkingBinding` | string | "off" (unset) | — | fork（多模型），只能按会话写："strip_retry" = Anthropic 协议的上游回 400「Invalid `signature` in `thinking` block … bound to a different conversation」时，把这一份外发副本里 assistant 消息的 thinking / redacted_thinking 全去掉、只重发一次（只有思考的 assistant 消息整条不发；最后一条就是只有思考的那种时不重发；只是签名坏了的 400 不管）。最后一条是带 tool_result 的 user、而它前面那轮 assistant 的思考被去掉了时，重发的这一份连顶层 thinking 参数一起去掉（开着 thinking 时 Anthropic 要求这一轮以思考块开头），也就是这一份不思考。会话和账本里的原文不动。会话 metadata.thinkingStrip 记数，日志打 [thinking-strip]，重发在证据账里是一条 reason thinking-strip 的出口行。"off" = 400 原样回给客户端。 |
+| `compress.sessions.*.openaiReasoningAliases` | boolean | off (unset) | — | fork（多模型），只能按会话写：OpenAI chat-completions 线上，assistant 消息没有 `reasoning_content` 时，把 `reasoning` / `reasoning_text` 字段（vLLM 新版、有的网关这样回）当成思考来认，和 reasoning_content 一样估算、能折；外发时留下的思考写回原来的字段名。这个会话不走水位线快路。不开 = 只认 reasoning_content（和上游一样；别的字段在重建的外发里会丢掉）。 |
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。要求流式的上游现在由错误驱动自学习自动处理（非流式摘要的任何 400 都会触发一次性 SSE 探测，#2494），但网关超时（如 Cloudflare HTTP 524）永远无法触发自学习：在此类网关位于 bili 与源站之间时设置此项，或用于省去一次探测往返。 |
 | `compress.preserveRecentMessages` | number | 3 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
@@ -306,6 +325,8 @@
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
 | `compress.search` | object | off | — | search_context 的检索行为设置；当前含 planAware 重排。 |
 | `compress.search.planAware` | boolean | false | — | 开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。 |
+| `compress.search.engine` | "substring" \| "cjk" | unset（= substring） | — | fork：`"cjk"` 时本会话的 search_context 改由统一库消息行上的中文单字+双字 BM25 索引回答（带说话人的原话摘录）；不设或 `"substring"` 走旧路，逐字节不变。v2 的字段类型不对、或正则编译不过时，这一次请求里 engine（和 `around`）按关处理，别的配置不受影响。 |
+| `compress.search.around` | boolean | false | — | fork：插件清单里给 search_context 加可选参数 `around`（同一处聊天里某条 mNNNNN 前后的原话）；和 `engine` 互不依赖。 |
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | 覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。 |
 | `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
@@ -440,6 +461,7 @@
 | `BILI_MCP_NO_ORPHAN_ADOPT` | boolean-ish | off (=1 disables orphan adoption) | — | 多个宿主会话共享一个代理时，退出恢复会话的孤儿收养。 |
 | `BILI_MITM_HOSTS` | string[] (csv) | unset | — | 启动器通道：传给被派生代理的 MITM 白名单主机（区别于配置文件对应项 BILI_MITM_DOMAINS）。 |
 | `BILI_PLUGIN_AGENT` | boolean-ish | off | — | 派生通道：标记插件 agent 进程。 |
+| `BILI_HOST_HOME` | string | unset (os.homedir()) | — | fork（compress.foldHostFileImagePaths）：宿主给 read_image 展开 ~ 用的家目录，图片路径占位按它写成 ~ 相对路径。只在代理和宿主不在同一个家目录下（或演练架子里）才设。设得太浅（Users 那一层本身、盘符根目录）就一条路径都不留。 |
 | `BILI_IMAGE_RESCALE_MAX_DIM` | integer | 1600 | — | 出站图片降采样 pass 的最长边触发阈值（像素，#3400）；非数字或低于 128 的取值按默认处理。设计上仅环境变量。 |
 
 <!-- /bili:gen -->
@@ -1362,6 +1384,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** *（模型的原始窗口）*
 - **状态：** ACTIVE
 - **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。注意它同时也是**预检压缩的硬墙**：一旦载荷达到该值，代理会在转发前主动折叠上下文；若折叠后仍超出，请求会直接快速失败而不是发往上游。若希望日常上下文保持较小、同时允许大读取任务突发到原始窗口，请让 `modelContextLimit` 保持为原始窗口值，改用 `maxContextLimit` 作为软目标（见[软目标与弹性余量](#软目标与弹性余量-1122)）。
+- **按会话覆盖（fork，`compress.sessions`）。** 三级合并之外还有一级，只认会话身份、优先级最高：`"compress": { "sessions": { "<会话 id>": { "modelContextLimit": 256000 } } }`。键先和代理自己的会话 id 比（DSH 插件车道上就是 DSH 的会话 id，`session-…`），再和这一次请求的 `x-bili-plugin-conversation` 头比，按字段合并：同一个字段第一个写了的身份赢（派生出来的 `<sid>|aud:…` 链只写自己的上限时，不代写等开关照样从会话那一条继承）。值的写法和本键相同（绝对数，或按模型原始窗口算的 `"N%"`）。只在全局 `compress` 这一级读；条目里只收 `modelContextLimit`、`noGhostwrite`、`foldHostFileImages`、`epochMajorityGuard`，别的键或写坏的值只打一次 warn、不生效。插件车道上的会话一条都没对上时打一次 warn（换册、分叉接管、崩溃后新开，会话 id 都会变，条目要跟着搬）。上限按会话写时越线报错指名 `compress.sessions`。没写 `sessions` 时所有会话和原来逐项相同。用途：同一个上游、同一个模型上的两条会话（比如一条陪伴会话和它的帮手）要不同的窗口时，三级合并分不开，只能按会话写。
 - **溢出武装行为 (#3450)。** 当上游以"窗口超限"错误拒绝载荷时，代理会把这次拒绝"武装"给下一次尝试：若此处声明的窗口与上游给出的数值不一致，会记一条一次性警告（同时给出两个值）并按两者中较小者折叠；若错误正文还给出了 token 计数（如 `you requested N tokens (M in the messages, K in the completion)`），则把 `M` 记为实测载荷大小（上限不是尺寸），并在该武装存续期间从本墙中扣除 `K` 再判断载荷是否装得下——上游已证明完成份额与输入共用同一预算。下一次真实的 usage 报告会同时退役该武装与预留。如果你的声明有误，把本键设为真实窗口即可：警告消失，折叠目标随之修正。
 
 #### `outputHeadroomMaxPct`
@@ -1435,6 +1458,27 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   - `requireNudge`（时序门禁）：只有**当前轮次**压缩提醒真正送达过模型（post-gate 投递事实 `nudgeOutcome === "injected"`——advisory 提醒、模型自决指令、紧急提醒都算；"gated"/"vetoed"/"skipped" 不算）才允许模型发起 compress，否则拒绝并回一条错误回执，告知未提示压缩在本线路被禁用、等提醒出现再压。武装在同一轮内的 loop 重请求间保持（一轮响应一个提醒可连续折几次），到下一个未提示轮次自动解除。
   - `requireRecommendation`（范围门禁）：提交的每个范围必须落在 bili 当前**推荐**折叠的集合内——与 nudge 文案、`acp_status` 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算，带常规的 viable + dead-ref + `minCompressRangeChars` 过滤）。按「覆盖」判定而非精确相等：把推荐跨度拆成小段通过（bili 自己的首见消化指南就鼓励拆分）；已折进活跃块的消息豁免，重折已有块更新摘要保持合法。范围里含任何其他仍存活消息则整体拒绝，回执点名越界跨度并指向 `acp_status`。
   - 豁免与交互：bili **自己**的溢出兜底折叠（preflight / auto-fold——不涉及模型调用）两个门禁都豁免，被门禁的会话不会因上下文溢出而死掉；即使 nudge 通道本身被自愈机制抑制（D1），可用性也不受影响。通过宿主自身机制驱动压缩的车道（如 codex 的 compaction trigger——它不是 bili 的提醒）不在时序门禁「已提示」的定义内——若这类车道与目标共用路由，请把这些设置限定到受影响的 provider/model 而不是全局开启。无新增环境变量；未显式开启任何一级时行为不变。
+
+#### `noGhostwrite`（fork）
+
+- **类型：** `boolean`
+- **默认值：** *（关闭，除非显式设置）*
+- **状态：** ACTIVE（fork，养成向）
+- **说明：** 「不代写」：开着时代理绝不替模型写摘要。越过上限只催模型自己压（催压提醒照常注入），下面这几条路一律不走：preflight 代写（主模型摘要、外部摘要链、确定性摘要、分层合并 #2952）、externalSummary 模式替模型的 compress 补写摘要（这时只收模型自己写的摘要，没写就照常拒）、autoFold 增长折叠（同时不再压住催压）。每次「本来要代写」的地方在会话 `metadata.noGhostwrite` 里记一个数（`preflight` / `externalSummary` / `autoFold`，外加最后一次的时间和路；preflight 只在走过「按自己的估计放得下就放行」那道出口、真要动手折的时候才记），日志带 `[no-ghostwrite]`。越线以后这样接：载荷加这次的输出预算放得进模型真实窗口（和上游报过的总墙取小）就原样转发；载荷本身放得进、只是加上输出预算放不进时，把这次请求的输出预算收到剩下的空间（留出余量，不低于 4096，够模型调一次 compress），记 `outputClamped` 再转发；连这样都放不进才回 413（retryable=false），也不代写。注意：没设按会话上限时，触发线（真实窗口减去输出预留）就在「加上输出预算放不进」那条线上，所以第一次越线就会走「收小输出预算」这一步。内核的 emergency-truncate（用量到预留后窗口的 95% 时剪最近 3 条以外的长工具输出，不够再剪长的用户 / 助手文字，剪的结果每轮重放直到下一次折叠成功）不写摘要，不归这个开关管，照旧会剪。三级都能写（深的一级赢），按会话写在 `compress.sessions.<会话 id>.noGhostwrite`（比三级都优先）。未显式开启时行为与上游完全相同。注意：插件清单（manifest）是按全局一级生成的，只在按会话开的时候，清单上的 compress 工具说明不跟着变（只有全局开了 externalSummary 时才有差别）。
+
+#### `foldHostFileImages`（fork）
+
+- **类型：** `boolean`
+- **默认值：** *（关闭 = 上游行为：Anthropic 线上 `source.type: "file"` 的图连同所在的消息钉住，不折）*
+- **状态：** ACTIVE（fork，养成向）
+- **说明：** 宿主（如 DSH 走 DeepSeek 的 Anthropic 接口）把图传到提供方的 Files API，请求里只带 `{type:"file", file_id}`；原图在宿主那边，file_id 会过期（DeepSeek 7 天），宿主到期前自己重传、换新 id。打开后**工具结果里的**这类图可以折（顶层、直接贴在消息里的 file 图照旧钉住：它们没有字节可编身份，只靠出现顺序区分，前面一张一变后面整族挪号，块会盖到另一张图上；换来源时 id 也会变，折掉的会露回来），守四条：①发给上游的图片块只能是这一次宿主送来的——出站里凡是这次入站没有的 file_id 一律换成占位字「[图片（原图在宿主那边）]」，并在会话 `metadata.hostFileImagesReplaced` 里记数（正常的路上不会发生，这是兜底；增量车道、render 拼接、snapshotRender 第二轮这三条从账本拼历史的路它管不着，这三样 rollout 现在都是 0%，打开前要先改闸）；②摘要里不把 file_id 当成能取回的句柄（`MEDIA REFS` 只认网址），新块尾巴写「这一段里有 N 张图，已折起：像素不在这里，decompress 拿不回图，原图在宿主那边」；③工具结果的身份按工具名和文字编、不含 file_id，重传换 id、base64 和 file 来回换都不换身份，可折性不随来源翻；④折掉以后像素就不在代理这里了，`decompress` 只还原文字，`decompress({ imageRef })` 拿不回这类图。占位字、取图失败的回执都只在开关开着时换；不开时逐字节同上游。三级都能写（深的一级赢），也能按会话写（`compress.sessions.<会话 id>.foldHostFileImages`，只给这一条会话放开）。以后关掉只停住新的折叠：已经折掉的图不会回到视图（能不能折只在建块时判一次），要回来得等那些块失效。只管 Anthropic 线；OpenAI 线上的 `file_id` 仍按上游 #5620 处理。
+
+#### `epochMajorityGuard`（fork）
+
+- **类型：** `boolean`
+- **默认值：** *（关闭 = 0.1.213 的判断）*
+- **状态：** ACTIVE（fork，养成向）
+- **说明：** 上游 #5737（v0.1.214，修 #5715）的「活着的多数」判断，在这条分支上做成开关：开着时，对账发现活着的块盖住的硬消息（去掉思考块、分隔符、预期改写）严格过半仍原样在线上，就不置「等确认」记号（`foldEpochConfirmPending`），已经挂着的当场清掉，只记一行 info。记号只挡 preflight 代写，所以**没开 `noGhostwrite` 时打开它，越线时代理会恢复代写**；要和 `noGhostwrite` 一起开。三级都能写，也能按会话写（`compress.sessions.<会话 id>.epochMajorityGuard`）。
 
 #### `preserveRecentMessages`
 
@@ -1582,6 +1626,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE（CCR v3 规划感知检索，#1336 —— 默认关闭、实测后再启用；代理模式 + 插件模式）
 - **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，候选块会按当前**规划状态**重排：规划状态从上下文内的消息视图提取——每个规划工具的**最后一次** tool-call（内置模式 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，外加全部 `compress.protectedLatestTools` 模式——与内核快照保护的 latest-wins 语义相同）以及最近一条用户消息。候选块的 topic/summary 与该状态的词项做加权重叠打分：得分 >0 的块排前，同分保持原词法顺序。仅在此条件下发生两件事：返回子集可能不同于纯词法截断；结果末尾追加 `[plan-aware]` 引导段——(a) `top fetch targets:` 列出得分最高的返回块所覆盖的 ref 区间，(b) 对本会话内已 retrieve ≥2 次的覆盖 ref 给出提示，建议改用一次性 `decompress({blockId, startId, endId})` 区间恢复代替反复 `acp_retrieve`。标志关闭、上下文中无规划状态、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只动候选顺序——不改存储/折叠/注入机制、不新增持久化、跨会话搜索（`conversation_id`）保持只读词法。每次重排记一条 `[acp-search-plan] …` 日志（含逐块得分）。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数 + 其中有多少次存在更便宜的精确路径可用——即该块带 ref 区间且 CCR 已武装），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
   - `planAware: boolean` — 总开关；非 `true` 一律保持功能完全关闭。
+  - fork 的 search v2（全部默认关；配置文件原样读：v2 的字段类型不对、或正则编译不过时，每次请求都把 v2 引擎和 `around` 当关着，直到改好（记一行 warn），`planAware` 和别的配置不受影响；设置页不让保存这样的块）：`engine: "substring" | "cjk"`；`around: boolean`；`budget: number`（每次结果的摘录字数，300–4000，默认 1000）和 `budgetByModel: { [模型]: number }`（先认完整模型键，再认最后一个 `/` 之后那段）；`maxHits`（1–8，默认 5）；`hubs: string[]`（太常见、查询里去掉的词）；`aliases: string[][]`；`headPatterns`、`envelopePattern`、`mediaPattern`、`dropPatterns`（正则源，清洗时编译验证）；`speakerAttr`、`idAttr`、`ownerIds`、`ownerName`、`ownerLabels`、`selfName`；`toolWeights`、`laneWeights`、`laneLabels`；`includeReasoning`、`includeSts`；`promiseFlip`（再按你↔我对调查一遍）。要有统一库，没有就走旧路。日志 `[search-v2]` 只记计数，不记查询原文。
 
 #### `rules`
 

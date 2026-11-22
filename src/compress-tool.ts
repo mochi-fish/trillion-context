@@ -243,6 +243,28 @@ export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.nam
 export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
+// fork search v2 (11-20): the optional `around` argument of search_context
+// (an mNNNNN ref — "show the messages before and after this one"). Advertised
+// only by the plugin manifest and only while the BASE config sets
+// compress.search.around = true (same conservative rule as #1712's range
+// params); every other variant stays byte-identical. Added before the pack's
+// tool-description overrides run, so a pack's paramDescriptions.around applies.
+const SEARCH_AROUND_PARAM = {
+    type: "string",
+    description: "Optional mNNNNN message ref from an earlier search_context result: returns the messages just before and after it in the same conversation (query then only highlights). Omit for a normal search.",
+};
+type SearchToolLike = { name?: string; input_schema?: JsonSchemaObject; parameters?: JsonSchemaObject; function?: { name: string; parameters: JsonSchemaObject } };
+export function withSearchAroundParam<T extends SearchToolLike>(tools: readonly T[]): T[] {
+    const add = (schema: JsonSchemaObject): JsonSchemaObject => ({ ...schema, properties: { ...schema.properties, around: SEARCH_AROUND_PARAM } });
+    return tools.map((t) => {
+        if (t.function) return t.function.name === SEARCH_CONTEXT_TOOL_NAME ? ({ ...t, function: { ...t.function, parameters: add(t.function.parameters) } } as T) : t;
+        if (t.name !== SEARCH_CONTEXT_TOOL_NAME) return t;
+        if (t.input_schema) return { ...t, input_schema: add(t.input_schema) } as T;
+        if (t.parameters) return { ...t, parameters: add(t.parameters) } as T;
+        return t;
+    });
+}
+
 // #3252 (code-mode/PTC harnesses): a code-mode harness (dsh "PTC" preset,
 // Cloudflare-style code mode) collapses every registered tool behind ONE
 // directly callable `run_code` tool — the model writes a program and calls

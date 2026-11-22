@@ -12,7 +12,8 @@ import { type BiliMessage } from "acp-kernel/wire";
 import { absorbToolName, applyAbsorbView } from "../absorb.js";
 import { APIG_RESIGN_SCHEME, resignApig } from "../apig-resign.js";
 import { noteSuccessfulForward } from "../cache-keepalive.js";
-import { credentialFingerprint, generationParamFp, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, noteClientAbort, noteFishEgress, noteForwardedBody, noteForwardedImageFacts, noteInboundMessages, noteOutboundContextEstimates, setCaptureFishReq, settleOverflowCalibration, settleUsageReport, withCacheCapture } from "../cache-ledger.js";
+import { fishRequestIdFromHeaders } from "../fish-ledger.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { stampOutbound } from "../chain-checkpoint.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "../compat-drop.js";
@@ -71,6 +72,7 @@ import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./stream-io.js";
 import { buildForwardTarget, makeFoldPointReasoningDroppable, outboundPayloadBreakdown, registerRequestAbort, beginStreamKeepalive, effectiveTokenCount, googlePathKind, imageBillingFor, imageTokenCapFor, inboundResignCredential, outboundContextEstimates, repairResponsesAssistantOrdering, resolveUpstream, stripKernelSummaries, usageGradeInputBaseline, DOOMED_PROBE_ABSOLUTE_BYTES, DOOMED_PROBE_BYTES_PER_TOKEN, type Prepared } from "../server.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
+import { anthropicStripRetryOn, isThinkingBindingError, stripAnthropicThinking } from "../model-windows.js";
 
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
@@ -339,6 +341,20 @@ async function forwardCaptured(
     throttleModelHint?: string,
 ): Promise<void> {
     const forwardStartedAt = Date.now();
+    // fish-ledger P0: the host's request id (loopback-only header, stripped at
+    // egress by UPSTREAM_HOP_HEADERS) — validated once, filed on the capture so
+    // every egress/usage row of this forward carries it.
+    const fishReq = fishRequestIdFromHeaders(req.headers);
+    setCaptureFishReq(fishReq);
+    let fishLocalSends = 0;
+    const fishEgress = (lane: "main" | "resend", reason: string | null, sent: string | Buffer | undefined, extra: { msgs?: number | null; samePayload?: boolean | null } = {}): void => {
+        if (req.method === "GET" || req.method === "HEAD") return;
+        noteFishEgress({
+            lane, reason, body: sent, upstreamUrl: fishUpstreamUrl, model: typeof prepared?.model === "string" ? prepared.model : undefined,
+            sid: prepared?.session.id, fishReq, localSend: () => ++fishLocalSends, ...extra,
+        });
+    };
+    let fishUpstreamUrl: string | undefined;
     const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepared.session, () => !res.destroyed) : undefined;
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
@@ -381,6 +397,7 @@ async function forwardCaptured(
     // compress-retry bodies must carry the same drops as the initial forward).
     let compatDropPaths: string[] = [];
     const { upstreamUrl, headers, proxyUrl, skippedProxy } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
+    fishUpstreamUrl = upstreamUrl;
     // #3129: v1internal egress re-wrap — every outbound model body (initial send,
     // role-ladder retry, overflow refold, compress-loop round 2+) must go back to
     // Antigravity inside the CloudCode envelope it arrived in. String-level for
@@ -806,6 +823,8 @@ async function forwardCaptured(
     // previous request's body. Loop re-fetches re-note their own rebuilt bodies
     // (loop/core.ts fetchUpstream); side requests never settle usage and must
     // not clobber the slot.
+    let fishMsgs: number | null = null;
+    let fishSamePayload: boolean | null = null;
     if (prepared?.session && !prepared.sidePassthrough && req.method !== "GET" && req.method !== "HEAD") {
         const sentBody = typeof wireBody === "string" ? wireBody : wireBody.toString("utf8");
         // #2078: ONE parse of the outbound body for the whole seam block — the
@@ -845,7 +864,8 @@ async function forwardCaptured(
         // #3803: the generation-parameter fingerprint rides the SAME full parse as the message count —
         // it is extracted from sentParsed (the complete object), never from the capped body head, so a
         // trailing-field flip is seen even when the body exceeds SEAM_BODY_CAP.
-        noteForwardedBody(prepared.session, sentBody, Array.isArray(sentArr) ? (sentArr as unknown[]).length : null, credentialFingerprint(headers), generationParamFp(sentParsed));
+        fishMsgs = Array.isArray(sentArr) ? (sentArr as unknown[]).length : null;
+        fishSamePayload = noteForwardedBody(prepared.session, sentBody, fishMsgs, credentialFingerprint(headers), generationParamFp(sentParsed));
         // #3023: the client's own resent view — the protocol conversion of the
         // inbound bytes BEFORE processTurn folded/replaced anything, captured
         // with the exact same pairing semantics so detectSeam can attribute a
@@ -881,8 +901,16 @@ async function forwardCaptured(
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
             ...(renderTailStart !== undefined ? { renderTailStart } : {}),
+            ...(prepared.openaiReasoningAliases !== undefined ? { openaiReasoningAliases: prepared.openaiReasoningAliases } : {}),
         });
     }
+    // fish-ledger P0 (egress, lane main): the exact bytes this forward is about
+    // to put on the wire (init.body — v1-wrapped where applicable), noted
+    // BEFORE the breaker / throttle gates: the row means "about to send these
+    // bytes"; whether they went out shows in the matching usage row.
+    // Side-request passthroughs and session-less passthroughs are model
+    // traffic too — filed under the same lane with their own reason.
+    fishEgress("main", prepared === null ? "passthrough" : prepared.sidePassthrough ? "host-side" : null, init.body as string | Buffer | undefined, { msgs: fishMsgs, samePayload: fishSamePayload });
     // #3148: round-level breaker — while the endpoint is provably dead, fail
     // fast WITHOUT contacting it instead of burning another full cold send +
     // the whole in-request retry ladder per host-driven retry round. The
@@ -1004,7 +1032,9 @@ async function forwardCaptured(
         try {
             const shrunkWire = scrubLoneSurrogatesOnWire(shrunk);
             applyResign(headers, shrunkWire);
-            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(shrunkWire) }, undefined, clientAbort.signal);
+            const shrunkSend = v1Wrap(shrunkWire);
+            fishEgress("resend", "ws-1009-shrink", shrunkSend);
+            const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: shrunkSend }, undefined, clientAbort.signal);
             if (retried.response.ok) {
                 firstAttemptClear?.();
                 wireBody = shrunkWire;
@@ -1119,7 +1149,9 @@ async function forwardCaptured(
                     let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
                     try {
                         applyResign(headers, fixed.body);
-                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(fixed.body) }, undefined, clientAbort.signal);
+                        const hopSend = v1Wrap(fixed.body);
+                        fishEgress("resend", "role-compat", hopSend);
+                        r = await fetchWithTimeout(upstreamUrl, { ...init, body: hopSend }, undefined, clientAbort.signal);
                     } catch {
                         return "other"; // transport failure — keep the original 400
                     }
@@ -1218,7 +1250,9 @@ async function forwardCaptured(
                 let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
                 try {
                     applyResign(headers, strippedPckBody);
-                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(strippedPckBody) }, undefined, clientAbort.signal);
+                    const pckSend = v1Wrap(strippedPckBody);
+                    fishEgress("resend", "pck-probe", pckSend);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: pckSend }, undefined, clientAbort.signal);
                 } catch {
                     retried = null; // transport failure — inconclusive, original 400 stands
                 }
@@ -1249,6 +1283,79 @@ async function forwardCaptured(
                         retried.clearTimer();
                         log("debug", `[${prepared.session.id}] [pck] A/B retry without prompt_cache_key also failed (${retried.response.status}) — not the key's fault; key stays, original 400 forwarded (#2645)`);
                     }
+                }
+            }
+        }
+    }
+    // fork (multi-model, M7, session anthropicThinkingBinding:"strip_retry"):
+    // Anthropic's preserved-thinking prefix check answers a replayed thinking
+    // block whose conversation prefix changed (the proxy folded / truncated /
+    // rewrote this outbound copy) with a 400 "Invalid `signature` in
+    // `thinking` block. The block is bound to a different conversation." —
+    // retrying the same body fails the same way. The documented no-beta
+    // recovery: strip every thinking / redacted_thinking block from the
+    // history and retry ONCE. Only this outbound copy changes (the session,
+    // the ledger and the host's own transcript keep their blocks). Accepted ⇒
+    // adopt the retry; anything else ⇒ the original 400 passes through.
+    // Off (default) = this block is never entered.
+    if (
+        prepared &&
+        prepared.protocol === "anthropic" &&
+        anthropicStripRetryOn(config) &&
+        req.method !== "GET" &&
+        req.method !== "HEAD" &&
+        typeof wireBody === "string" &&
+        upstreamResult.response.status === 400 &&
+        upstreamResult.response.body
+    ) {
+        let bindErrText: string | null = null;
+        try {
+            bindErrText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            bindErrText = null;
+        }
+        if (bindErrText !== null) {
+            upstreamResult = {
+                response: new Response(bindErrText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            const stripped = isThinkingBindingError(400, bindErrText) ? stripAnthropicThinking(wireBody) : null;
+            if (isThinkingBindingError(400, bindErrText) && stripped === null) {
+                log("warn", `[${prepared.session.id}] [thinking-strip] upstream rejected a thinking block as bound to a different conversation, but the outbound copy has nothing strippable (or the last message is thinking only) — passing the 400 through`);
+            }
+            if (stripped !== null) {
+                let retried: Awaited<ReturnType<typeof fetchWithTimeout>> | null = null;
+                try {
+                    applyResign(headers, stripped.body);
+                    const stripSend = v1Wrap(stripped.body);
+                    fishEgress("resend", "thinking-strip", stripSend);
+                    retried = await fetchWithTimeout(upstreamUrl, { ...init, body: stripSend }, undefined, clientAbort.signal);
+                } catch {
+                    retried = null; // transport failure — the original 400 stands
+                }
+                const s = prepared.session;
+                const prevCount = typeof s.metadata.thinkingStrip === "object" && s.metadata.thinkingStrip !== null ? (s.metadata.thinkingStrip as { retries?: number; accepted?: number }) : {};
+                const accepted = retried !== null && retried.response.ok;
+                s.metadata.thinkingStrip = { retries: (prevCount.retries ?? 0) + 1, accepted: (prevCount.accepted ?? 0) + (accepted ? 1 : 0), lastAt: Date.now(), lastStripped: stripped.stripped };
+                markDirty(s);
+                if (retried !== null && accepted) {
+                    upstreamResult.clearTimer();
+                    wireBody = stripped.body;
+                    upstreamResult = retried;
+                    log("info", `[${s.id}] [thinking-strip] thinking block bound to a different conversation → stripped ${stripped.stripped} thinking block(s) from ${stripped.messages} assistant message(s) of this outbound copy${stripped.dropped > 0 ? ` (${stripped.dropped} thinking-only message(s) left out)` : ""}${stripped.thinkingOff ? " and turned thinking off for this request (the tool loop's last assistant turn no longer starts with a thinking block)" : ""}, re-sent once, upstream accepted (session/ledger keep the originals)`);
+                } else if (retried !== null) {
+                    if (retried.response.body) {
+                        try { await readStreamToBuffer(retried.response.body); } catch { /* discarded either way */ }
+                    }
+                    retried.clearTimer();
+                    log("warn", `[${s.id}] [thinking-strip] stripped re-send still failed (HTTP ${retried.response.status}) — the original 400 passes through`);
+                } else {
+                    log("warn", `[${s.id}] [thinking-strip] stripped re-send failed in transport — the original 400 passes through`);
                 }
             }
         }
@@ -1470,7 +1577,9 @@ async function forwardCaptured(
                     try {
                         s.metadata.imageCountShed = { at: Date.now(), phase: "same-request-retry", cap: overflowInfo.imageCountCap, archived: countShed.stats.archived };
                         applyResign(headers, countShed.body);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(countShed.body) }, undefined, clientAbort.signal);
+                        const shedSend = v1Wrap(countShed.body);
+                        fishEgress("resend", "image-shed", shedSend);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: shedSend }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = countShed.body; // track the accepted re-send as the wire base
@@ -1526,7 +1635,9 @@ async function forwardCaptured(
                         // surrogate can't poison the retry (see the #1884 seam).
                         const wireRefolded = typeof refolded.body === "string" ? scrubLoneSurrogatesOnWire(refolded.body) : refolded.body;
                         applyResign(headers, wireRefolded);
-                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: v1Wrap(wireRefolded) }, undefined, clientAbort.signal);
+                        const refoldSend = v1Wrap(wireRefolded);
+                        fishEgress("resend", "refold", refoldSend);
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refoldSend }, undefined, clientAbort.signal);
                         if (retried.response.ok) {
                             upstreamResult.clearTimer();
                             wireBody = wireRefolded; // #1900: track the accepted re-send as the wire base
@@ -1848,6 +1959,9 @@ async function forwardCaptured(
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
+            // A buffered replacement may come from a different response; the optional dump tee below retains this one's identity.
+            const requestId = prepared.stream && prepared.protocol === "anthropic" && targetOrigin === "https://api.anthropic.com" && pluginBody === upstream.body
+                ? upstream.headers.get("request-id") ?? undefined : undefined;
             // #2347: raw-dump twin of the tee below — this branch returns
             // before reaching it, so plugin-mode turns need their own.
             if (opts.dumpSse && prepared.stream && pluginBody) {
@@ -1860,7 +1974,7 @@ async function forwardCaptured(
                 // first attempt's status/content-type (a resolveFakeCompletion
                 // re-send is not reflected; the pipes' own diag says which
                 // retry budget was spent instead).
-                const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined };
+                const upstreamMeta: UpstreamMeta = { status: upstream.status, contentType: upstream.headers.get("content-type") ?? undefined, requestId };
                 // #2346: intrinsic runaway-enumeration terminator for the plugin-streamed
                 // body (the incident lane). Applied after any fake-completion buffering so
                 // both the live and replayed paths are guarded; byte-verbatim otherwise.
@@ -2488,6 +2602,8 @@ async function resolveFakeCompletion(
             let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
             try {
                 opts.resign?.(opts.reqHeaders, wireHinted);
+                // fish-ledger P0: same-request re-send with a changed body.
+                noteFishEgress({ lane: "resend", reason: "fake-done-retry", body: wireHinted, upstreamUrl: opts.upstreamUrl, sid });
                 r = await fetchWithTimeout(
                     opts.upstreamUrl,
                     {

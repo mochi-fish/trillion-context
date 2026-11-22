@@ -32,6 +32,18 @@
  * URLs are therefore classified as NON-recoverable (the message keeps
  * pinning). Deliberately over-eager: a false positive only re-pins one media
  * message; a false negative silently loses the payload.
+ *
+ * fork (companion lane): the Anthropic `{type:"file", file_id}` image source
+ * is NOT a re-access handle and is never extracted here — on DeepSeek a file
+ * id expires after 7 days and the HOST re-uploads the original under a fresh
+ * id before every request that needs it, so a recorded id would be a dead or
+ * misleading pointer. Such images are pinned by default (upstream behavior);
+ * Config.foldHostFileImages lets them fold WITHOUT a handle when they sit in a
+ * tool_result (a top-level file image keeps pinning — positional identity):
+ * the pixels leave the view, the original stays with the host, and decompress
+ * cannot restore the image (it restores the surrounding text only — not
+ * lossless for the image). See isHostHeldFileSource below. The OpenAI-wire `file_id` parts
+ * above keep the upstream #5620 handling unchanged.
  */
 import type { CompressionBlock, CoreMessage } from "./types.js";
 
@@ -67,7 +79,10 @@ function isInlineDataUrl(u: unknown): boolean {
  *  - credential/session keys (`Signature`/`sig`/`token`/`session-token`/
  *    `security-token`/`auth` — session-bound tokens on private CDNs).
  *  Non-HTTP refs (DeepSeek `file_id`, `gs://` URIs, bare ids) never match —
- *  they are durable by definition of the #5620 split. */
+ *  they are durable by definition of the #5620 split. (fork note: a DeepSeek
+ *  file id is NOT durable in practice — uploads expire after 7 days; on the
+ *  Anthropic wire it is never extracted at all, see the module header. The
+ *  OpenAI-wire #5620 handling is left as upstream wrote it.) */
 const EPHEMERAL_QUERY_PARAM =
   /^(?:x-(?:amz|goog|ms|cf|r2|oss|azure)-.*|(?:expires?|expiry|exp|ttl|signature|sig|session-token|security-token|token|auth))$/i;
 
@@ -167,6 +182,31 @@ export function extractMediaRefs(message: CoreMessage): string[] {
   }
 
   return [...new Set(refs)];
+}
+
+/** fork (companion lane): an Anthropic image source the HOST holds — a
+ *  `{type:"file", file_id}` reference into a provider Files API. The proxy has
+ *  no bytes and the id is NOT a durable handle (DeepSeek expires uploads after
+ *  7 days and the host re-uploads under a fresh id), so it is deliberately NOT
+ *  extracted by extractMediaRefs: no file id ever lands in a summary as if it
+ *  could re-acquire the image. Whether such an image may fold at all is the
+ *  host's call (Config.foldHostFileImages, read by hasUnrecoverableMediaPayload);
+ *  folding it only drops the pixels from the view — decompress cannot restore
+ *  them, the original stays with the host. */
+export function isHostHeldFileSource(source: unknown): boolean {
+  const s = asObj(source);
+  return s?.type === "file" && typeof s.file_id === "string" && s.file_id.length > 0;
+}
+
+/** fork: per-call options for the media pin decision. */
+export interface MediaFoldOptions {
+  /** Config.foldHostFileImages — see isHostHeldFileSource. */
+  foldHostFileImages?: boolean;
+}
+
+/** fork: the options a kernel Config implies (absent field = upstream behavior). */
+export function mediaFoldOptions(config: { foldHostFileImages?: boolean } | undefined): MediaFoldOptions | undefined {
+  return config?.foldHostFileImages === true ? { foldHostFileImages: true } : undefined;
 }
 
 /** True when msg carries at least one extractable re-access handle — the

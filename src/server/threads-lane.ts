@@ -43,6 +43,8 @@ import { estimateRawBodyTokens } from "../preflight.js";
 import { defaultCountTokens } from "acp-kernel";
 import type { Session } from "../session.js";
 import { fetchWithTimeout } from "../fetch-util.js";
+import { noteFishEgress } from "../cache-ledger.js";
+import { noteSideUsage } from "../fish-ledger-usage.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 
 /** Raw wire message as the client sent it. Stored verbatim so the reforge
@@ -423,7 +425,10 @@ export async function executeThreadsReforge(
         // watchdog, direct-dispatcher fallback, manual redirects); the proxy
         // decision rides the dispatcher exactly like the main forward does.
         let summaryText: string | undefined;
-        const { response: resp, clearTimer } = await fetchWithTimeout(upstreamUrl, { method: "POST", headers, body: JSON.stringify(summaryReq), ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl) } : {}) }, SUMMARY_TIMEOUT_MS);
+        const summaryBody = JSON.stringify(summaryReq);
+        // fish-ledger P0 (egress, lane side): the proxy's own summary call.
+        noteFishEgress({ lane: "side", reason: "threads-summary", body: summaryBody, upstreamUrl, model: typeof parsed.model === "string" ? parsed.model : undefined, sid: sessionId });
+        const { response: resp, clearTimer } = await fetchWithTimeout(upstreamUrl, { method: "POST", headers, body: summaryBody, ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl) } : {}) }, SUMMARY_TIMEOUT_MS);
         try {
             if (!resp.ok) {
                 const detail = await sideCallErrorDetail(resp);
@@ -431,7 +436,10 @@ export async function executeThreadsReforge(
                 log("warn", `[${sessionId}] [threads] summary side-call failed (HTTP ${resp.status}${detail ? ` ${detail}` : ""}) → ${urlPathOf(upstreamUrl)} — forwarding continue unchanged (#2926/#3569)`);
                 return { ok: false };
             }
-            const json = (await resp.json()) as { content?: { type?: string; text?: unknown }[] };
+            const raw = await resp.text();
+            // fish-ledger P0 (usage, lane side): the summary side call's own usage.
+            noteSideUsage({ protocol: "anthropic", text: raw, sid: sessionId, upstreamUrl, model: typeof parsed.model === "string" ? parsed.model : undefined });
+            const json = JSON.parse(raw) as { content?: { type?: string; text?: unknown }[] };
             const textBlock = json.content?.find((b) => b.type === "text");
             summaryText = typeof textBlock?.text === "string" ? textBlock.text : undefined;
         } finally {

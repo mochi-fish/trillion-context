@@ -40,6 +40,13 @@ process.env.XDG_CONFIG_HOME = path.join(root, "config");
 // must point at dirs that exist. An existing EMPTY dir is the normal
 // "no sessions yet" state the read paths already handle.
 for (const name of ["sessions", "data", "state", "cache", "config"]) mkdirSync(path.join(root, name), { recursive: true });
+// fish-ledger P0: the proxy's ledger root defaults to <homedir>/.dsh-fish-ledger on the DSH lane, and on
+// Windows os.homedir() follows USERPROFILE only — a test that swaps HOME (the #4977 suite starts real
+// DSH-lane proxies exactly like that) would still resolve the developer's REAL home. Pin an absolute,
+// never-created root for the whole suite (unconditional, same discipline as the XDG roots above): every
+// child spawned with `...process.env` inherits it and lands on no-root/missing. Tests that exercise a
+// ledger point FISH_LEDGER_DIR at their own tmp root and restore it afterwards.
+process.env.FISH_LEDGER_DIR = path.join(root, "no-fish-ledger");
 // #4313 default-on follow-up: the PRODUCTION default for message-timestamp
 // display is now ON (src/config.ts resolveMessageTimestamps), so an unpinned
 // ambient would flip every byte-comparing baseline in the suite into

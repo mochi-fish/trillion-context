@@ -336,6 +336,12 @@ export {
   listSearchAlgorithms,
 } from "./search.js";
 export {
+  extractMediaRefs,
+  isHostHeldFileSource,
+  mediaFoldOptions,
+  type MediaFoldOptions,
+} from "./media-refs.js";
+export {
   collectLatestProtected,
   collectProtectedToolCallIds,
   hasMediaPayload,

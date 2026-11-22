@@ -72,7 +72,20 @@ type Flat = { msgs: BiliMessage[]; systemText: string };
  *  covered it removed the model's system prompt from the rebuilt wire
  *  entirely. Mid-conversation system messages (rare, host-synthetic) stay in
  *  the fold space unchanged. */
-export function openaiToCore(body: OpenAIRequestBody): Flat {
+/** fork (multi-model, M8): options for openaiToCore. */
+export type OpenaiToCoreOptions = {
+  /** Assistant-message fields read as reasoning when `reasoning_content` is
+   *  absent (not a string), first present wins — e.g. ["reasoning",
+   *  "reasoning_text"]. The reasoning core records the field it came from
+   *  (BiliMessage.reasoningField) so coreToOpenai writes it back under the
+   *  same name. Unset / empty = upstream behavior, byte-identical. */
+  reasoningAliases?: readonly string[];
+};
+
+export function openaiToCore(body: OpenAIRequestBody, options?: OpenaiToCoreOptions): Flat {
+  const reasoningAliases = options?.reasoningAliases?.filter(
+    (k) => typeof k === "string" && k.length > 0 && k !== "reasoning_content",
+  );
   const msgs: BiliMessage[] = [];
   const systemParts: string[] = [];
   const clusters = new ClusterCounter();
@@ -242,9 +255,22 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
         break;
       }
       case "assistant": {
-        const rawReasoning = m.reasoning_content;
+        let rawReasoning = m.reasoning_content;
+        // fork (M8): alias field (vLLM `reasoning`) only when the canonical
+        // field is absent; the core remembers which name it came from.
+        let aliasField: string | undefined;
+        if (typeof rawReasoning !== "string" && reasoningAliases !== undefined && reasoningAliases.length > 0) {
+          for (const k of reasoningAliases) {
+            const v = (m as Record<string, unknown>)[k];
+            if (typeof v === "string") {
+              rawReasoning = v;
+              aliasField = k;
+              break;
+            }
+          }
+        }
         const fieldPresent = typeof rawReasoning === "string";
-        const fieldReasoning = fieldPresent ? rawReasoning : "";
+        const fieldReasoning = typeof rawReasoning === "string" ? rawReasoning : "";
         let reasoning = fieldReasoning;
         let text = stringContent(m.content);
         if (!reasoning) {
@@ -278,6 +304,7 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
             contentType: "reasoning",
             text: reasoning,
             reasoningContent: reasoning,
+            ...(aliasField !== undefined && reasoning === fieldReasoning ? { reasoningField: aliasField } : {}),
           });
         }
         if (text) {
@@ -288,6 +315,7 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
             contentType: "text",
             text,
             ...(blankEcho ? { reasoningPresent: true } : {}),
+            ...(blankEcho && aliasField !== undefined ? { reasoningField: aliasField } : {}),
           });
         }
         if (Array.isArray(m.tool_calls)) {
@@ -404,6 +432,8 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
     toolCalls: OpenAIToolCall[];
     reasoning: string | null;
     reasoningPresent: boolean;
+    /** fork (M8): the alias field name the host used, if any. */
+    reasoningField?: string;
   } | null = null;
   const flush = () => {
     if (!pending) return;
@@ -413,11 +443,14 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
         : undefined;
     // A blank field means the host sent the key with an empty value and
     // expects it back: strict-echo thinking models reject its absence.
+    // fork (M8): re-emit under the host's own field name when an alias
+    // core said so; otherwise exactly the upstream key.
+    const fieldName = pending.reasoningField ?? "reasoning_content";
     const reasoningField =
       reasoning !== undefined
-        ? { reasoning_content: reasoning }
+        ? { [fieldName]: reasoning }
         : pending.reasoningPresent
-          ? { reasoning_content: "" }
+          ? { [fieldName]: "" }
           : {};
     if (pending.toolCalls.length > 0) {
       out.push({
@@ -432,8 +465,8 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
       out.push({
         role: "assistant",
         content: null,
-        reasoning_content: reasoning,
-      });
+        [fieldName]: reasoning,
+      } as OpenAIMessage);
     }
     pending = null;
   };
@@ -451,6 +484,7 @@ export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
           reasoningPresent: false,
         };
       if (m.reasoningPresent) pending.reasoningPresent = true;
+      if (m.reasoningField !== undefined) pending.reasoningField = m.reasoningField;
       if (m.contentType === "reasoning") {
         pending.reasoning =
           (pending.reasoning ?? "") + (m.reasoningContent ?? m.text ?? "");

@@ -446,6 +446,12 @@
       ],
       "endpoint": "/__bili/plugin/fork",
       "snapshotEndpoint": "/__bili/plugin/snapshot"
+    },
+    "fishLedger": {
+      "features": [
+        "fish-request-header"
+      ],
+      "header": "x-bili-plugin-fish-request"
     }
   }
 }

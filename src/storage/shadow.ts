@@ -968,6 +968,18 @@ export class UnifiedShadow {
         return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content, ts: m.ts ?? null }));
     }
 
+    /** fork search v2: bounded corpus page (see UnifiedStore.searchRowsPage). */
+    searchRowsPage(sessionId: string, afterSeq: number, limit: number, skipKinds?: readonly string[]): import("./store.js").SearchRow[] | null {
+        if (this.sync === null) return null;
+        return this.sync.searchRowsPage(sessionId, afterSeq, limit, skipKinds);
+    }
+
+    /** fork search v2: rows in a ref_num range (see UnifiedStore.searchRowsByRefRange). */
+    searchRowsByRefRange(sessionId: string, lo: number, hi: number): import("./store.js").SearchRow[] | null {
+        if (this.sync === null) return null;
+        return this.sync.searchRowsByRefRange(sessionId, lo, hi);
+    }
+
     /** #3756 snapshot render: the logical view's seq pointer list
      *  (tail_json.tailSeqs). Null when absent/malformed. */
     tailSeqs(sessionId: string): number[] | null {

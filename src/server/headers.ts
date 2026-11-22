@@ -43,6 +43,12 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // host↔bili bookkeeping like the pf-* handshake above; the real upstream
     // must never see it.
     "x-bili-msg-ids",
+    // fish-ledger P0: the local evidence ledger's request id — the DSH-side
+    // plugin stamps it on the loopback hop so the proxy can file the egress
+    // hash under the host's request id. Pure host↔bili bookkeeping like the
+    // #5658 turn id above; it must never reach a model endpoint, so strip at
+    // every egress site that consults this table.
+    "x-bili-plugin-fish-request",
     "te",
     "trailer",
     "upgrade",

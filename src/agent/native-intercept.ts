@@ -8,6 +8,7 @@
 
 import { installFetchChain, isDeadClosureError, resetFetchChainForTest } from "./fetch-chain/index.js";
 import { logHostEvent } from "./host-log.js";
+import { bumpFishClientStat, withoutFishRequestHeader } from "../fish-request.js";
 
 import { envMillis } from "./native-bootstrap.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
@@ -93,6 +94,9 @@ export interface NativeInterceptState {
      *  mode exactly like pi.ts's before_provider_headers stamp. Returning
      *  undefined sends the request untouched (wire mode). */
     headersFor?: (url: string) => Record<string, string> | undefined;
+    /** fish-ledger P0: whether the request-id header computed earlier may still
+     *  ride to `origin` (dsh-native's capability gate). Absent ⇒ never. */
+    fishHeaderValidFor?: (origin: string) => boolean;
     /** #2399: async pre-send hook — awaited (defensively; a hook error never
      *  breaks the request) per attributed model-API request after the tools
      *  gate clears and BEFORE headersFor is consulted. dsh-native uses it to
@@ -429,6 +433,21 @@ function withHeaders(input: string | URL | Request, init: RequestInit | undefine
         return { input, init: { ...init, headers: { ...(init.headers as Record<string, string>), ...extra } } };
     }
     return { input, init };
+}
+
+/** fish-ledger P0: headers computed for a now-dead origin are re-sent after a
+ *  recovery; the request-id header stays only while the capability gate still
+ *  holds for the origin the retry goes to — otherwise it is removed (counted),
+ *  so a proxy that never declared it cannot forward it upstream. */
+function fishRetryExtra(state: NativeInterceptState, extra: Record<string, string>, origin: string): Record<string, string> {
+    try {
+        if (state.fishHeaderValidFor?.(origin) === true) return extra;
+        const r = withoutFishRequestHeader(extra);
+        if (r.stripped) bumpFishClientStat("stripped");
+        return r.extra;
+    } catch {
+        return withoutFishRequestHeader(extra).extra;
+    }
 }
 
 /** #3329: the outgoing headers of a dispatch exactly as fetch resolves them —
@@ -1602,7 +1621,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 const fresh = await readyOrigin(state);
                 if (fresh !== undefined && fresh !== baked.origin) target = `${fresh}${baked.pathname}${baked.search}`;
             }
-            const stamped = withHeaders(target === url ? input : makeTarget(target), init, allExtra);
+            // fish-ledger P0: the first send goes to the origin baked into the URL (or its live replacement), which is
+            // not necessarily register.base — keep the request-id header only while the capability gate holds for
+            // THAT origin (two bili instances, #394/#3923: an old proxy at the baked origin would forward it upstream).
+            const stamped = withHeaders(target === url ? input : makeTarget(target), init, fishRetryExtra(state, allExtra, new URL(target).origin));
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
                 const resp = await send(stamped.input, stamped.init);
@@ -1647,7 +1669,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     // BILLION_CONTEXT_PROXY process-wide in the omp/pi lanes).
                     const u = new URL(target);
                     const retried = `${again}${u.pathname}${u.search}`;
-                    const restamped = withHeaders(makeTarget(retried), init, allExtra);
+                    const restamped = withHeaders(makeTarget(retried), init, fishRetryExtra(state, allExtra, again));
                     state.onDispatch?.(retried, "retry");
                     const resp = await send(restamped.input, restamped.init);
                     try {
@@ -1843,7 +1865,8 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
         // ride the proxy without a settings overlay.
         const branchExtra = { ...(state.headersFor?.(url) ?? {}), ...pfChannel.pfRequestHeaders(outgoingHeadersOf(input, init) ?? {}), ...(resignExtra ?? {}) };
         try {
-            const stamped = withHeaders(first, init, branchExtra);
+            // fish-ledger P0: same gate as the routed branch's first send — the header rides only to an origin that declared it
+            const stamped = withHeaders(first, init, fishRetryExtra(state, branchExtra, origin));
             const resp = await send(stamped.input, stamped.init);
             try {
                 pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);
@@ -1866,7 +1889,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
-                    const stamped = withHeaders(retried, init, branchExtra);
+                    const stamped = withHeaders(retried, init, fishRetryExtra(state, branchExtra, again));
                     const resp = await send(stamped.input, stamped.init);
                     try {
                         pfChannel.pfLearnStamp(outgoingHeadersOf(stamped.input, stamped.init) ?? {}, resp.status, resp.headers);

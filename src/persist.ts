@@ -2382,6 +2382,29 @@ export class SessionStore {
         }
     }
 
+    /** fork search v2 (11-20): one bounded page of stored rows for the
+     *  search corpus (retired included, media not hydrated). Null when the
+     *  unified store is unavailable — the caller then keeps the old search. */
+    unifiedSearchRowsPage(sessionId: string, afterSeq: number, limit: number, skipKinds?: readonly string[]): import("./storage/store.js").SearchRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.searchRowsPage(sessionId, afterSeq, limit, skipKinds);
+        } catch {
+            return null;
+        }
+    }
+
+    /** fork search v2 (11-20): stored rows with ref_num in [lo, hi]. Null when
+     *  the unified store is unavailable. */
+    unifiedSearchRowsByRefRange(sessionId: string, lo: number, hi: number): import("./storage/store.js").SearchRow[] | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.searchRowsByRefRange(sessionId, lo, hi);
+        } catch {
+            return null;
+        }
+    }
+
     /** #3756 snapshot render: the logical transcript view's seq pointers
      *  (tail_json.tailSeqs). Null when the unified store is unavailable. */
     unifiedTailSeqs(sessionId: string): number[] | null {

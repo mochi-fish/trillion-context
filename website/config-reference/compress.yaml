@@ -134,6 +134,72 @@ entries:
     desc_zh: "禁止越界的模型主动压缩（#5683）：提交的每个范围必须落在 bili 当前推荐折叠的集合内——即 nudge 文案与 acp_status 展示的同一份实时可压缩列表（有本轮 prepare 快照用快照，否则实时重算）。按「覆盖」判定而非精确相等：把推荐跨度拆小段通过；已折进活跃块的消息豁免（重折已有块更新摘要合法）。范围里含任何其他仍存活的消息则整体拒绝，回执点名越界跨度并指向 acp_status。默认关闭。"
     site_en: "Forbid out-of-bounds compression (off by default): only ranges bili currently recommends may be folded; subdividing a listed span or refolding an existing block stays legal."
     site_zh: "禁止越界压缩（默认关闭）：只允许折叠 bili 当前推荐的范围；拆分推荐跨度、重折已有块更新摘要仍合法。"
+  - key: compress.sessions
+    type: object
+    default: "unset"
+    group: compress
+    desc_en: "Fork (companion lane): per-session overrides above the global/provider/model cascade, keyed by the proxy session id (the dsh lane: the dsh session id) or the request's x-bili-plugin-conversation header, merged field by field (the first identity that sets a field wins); global level only; accepts modelContextLimit, noGhostwrite, foldHostFileImages, epochMajorityGuard, requireUsageSampleForTruncate, foldHostFileImagePaths and the session-only limitMode, truncateHoldAfterSwitch, anthropicThinkingBinding, openaiReasoningAliases (multi-model fork; a build that does not know one of them makes the web panel reject the whole sessions block). A plugin-lane session no entry matches logs one warn (a rotated or forked conversation gets a new id). Unset = upstream behavior."
+    desc_zh: "fork（养成向）：按会话的覆盖，优先级在全局 / 提供方 / 模型三级之上；键是代理的会话 id（DSH 车道就是 DSH 的会话 id）或这次请求的 x-bili-plugin-conversation 头，按字段合并（同一个字段第一个写了的身份赢）；只在全局一级读；只收 modelContextLimit、noGhostwrite、foldHostFileImages、epochMajorityGuard、requireUsageSampleForTruncate、foldHostFileImagePaths，以及只能按会话写的 limitMode、truncateHoldAfterSwitch、anthropicThinkingBinding、openaiReasoningAliases（多模型 fork；不认其中某个键的构建，网页面板会整个 sessions 块不认）。插件车道上一条都没对上的会话打一次 warn（换册、分叉后会话 id 会变）。不写 = 和上游一样。"
+  - key: compress.noGhostwrite
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (companion lane): never summarize on the model's behalf — preflight model/external/deterministic summaries and tier distill, external-summary completion of the model's compress, and auto-fold are all skipped. Over the configured window the request forwards as-is while payload + its output budget fit the model's real window; when only the output budget does not fit, that request's budget is shrunk (never below 4096) and it forwards; it is refused (413) only when not even that fits. Kernel emergency-truncate still applies. Each would-be ghostwrite and each budget shrink is counted in session metadata.noGhostwrite."
+    desc_zh: "fork（养成向）：「不代写」——代理绝不替模型写摘要：preflight 的模型 / 外部 / 确定性摘要和分层合并、externalSummary 替模型补写、autoFold 都不走。越过配置窗口时：载荷加这次的输出预算放得进模型真实窗口就原样转发；只是输出预算放不进时，把这次的输出预算收小（不低于 4096）再转发；连这样都放不进才回 413。内核的 emergency-truncate 照旧会剪。每次本来要代写、每次收小输出预算都在会话 metadata.noGhostwrite 里记数。"
+  - key: compress.foldHostFileImages
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (companion lane): let Anthropic source.type=\"file\" images (host-held, expiring provider file ids) inside tool results fold; top-level file images stay pinned (positional identity). The file id is never recorded as a re-access handle, the fold note says the original stays with the host, decompress cannot restore the image, and only file ids sent in the current request may reach the upstream. Also settable per session (compress.sessions). Turning it off later stops new folds only: images already folded stay folded. Off = upstream pinning."
+    desc_zh: "fork（养成向）：Anthropic 线上工具结果里 source.type=\"file\" 的图（原图在宿主那边、file_id 会过期）可以折；顶层的 file 图照旧钉住（身份只靠位置）。file_id 不当成能取回的句柄写进摘要，折叠尾巴写「原图在宿主那边」，decompress 拿不回图，发给上游的只许是这一次请求里的 file_id。也能按会话写（compress.sessions）。以后关掉只停住新的折叠，已经折掉的图不会回来。不开 = 上游的钉住。"
+  - key: compress.foldHostFileImagePaths
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (companion lane): only together with foldHostFileImages. When the model's own compress folds tool-result images, the block's mechanical footer lists, per image, the host's read-only normalized copy in its attachment store as a home-relative path (~/…/attachments/v1/objects/xx/<sha256>, read from the host's per-image handle text; no absolute path, no OS user name) that the model can open again with read_image; privacy checks fail closed: a result with no tool name (its tool_use is not in this request), a screenshot (mcp__wincu__ tools or any tool name containing windows_computer_use_, or any result whose text names a wincu screenshot file or .dsh-watch-, in any directory), a result header pointing into the temp dir (any tool, CRLF headers too) or one whose path cannot be compared literally (8.3 short names, device or UNC prefixes, dot segments, a segment ending in a dot or space), read_image without a recognizable header, a path whose segments above the attachment store contain the OS user name (home leaf, os.userInfo().username, USERNAME/USER, USERPROFILE leaf), a too-shallow home, a missing copy or an unrecognized handle are listed without a path, with the reason; an image id once seen as a screenshot, a temp-dir read or a nameless result gets no path anywhere else either (same block, other blocks, merges, decompress), remembered in session metadata (hostImagePathsNoPath, newest 1024). base64 images are listed too; when the block also carries upstream's 'restores pixels' line (or a consumed child did), the footer's first sentence says those ref-carrying images may still restore and the others cannot, instead of a blanket 'decompress cannot restore'. The compress receipt repeats the footer, merges carry consumed blocks' lines up (16 lines per block), and decompress({ imageRef }) for a host file image answers with the path. Existing blocks and history are never rewritten. Home defaults to os.homedir() (env BILI_HOST_HOME overrides). Also settable per session. Builds that do not know this key make the web panel's strict parser reject the whole sessions block — write it only after installing a build that knows it. Off = the plain host-held fold note."
+    desc_zh: "fork（养成向）：只在 foldHostFileImages 也开着时起作用。她自己 compress 折掉工具结果里的图时，块尾巴逐张列出宿主附件库里的只读规范化副本路径（~/…/attachments/v1/objects/xx/<sha256>，从宿主每张图前面的 handle 文字里认出来；不写绝对路径、没有系统用户名），她能用 read_image 再读；隐私那几道一律偏严：没有工具名（配对的 tool_use 不在这一次请求里）、屏幕截图（mcp__wincu__ 工具、名字里有 windows_computer_use_ 的工具，或者结果的字里有 wincu 截屏文件名、.dsh-watch-，不管哪个目录）、结果头指向临时目录（不管哪个工具，CRLF 换行的也认）或者路径没法按字面比（8.3 短名、设备或网络路径前缀、点段、某一段以点或空格结尾）、read_image 认不出结果头、附件库以上那几段里有系统用户名（家目录最后一段、os.userInfo().username、USERNAME/USER、USERPROFILE 最后一段）、家目录太浅、副本不在、认不出的，不留路径、照实写原因；一张图的编号在任何一处算截屏、临时目录、没有工具名，别处（同一块、别的块、并块、decompress）出现也不给路径，记在会话 metadata 里（hostImagePathsNoPath，留最新的 1024 个）。base64 的图也列；块里同时有上游那行「restores pixels」（或并进来的子块有过）时，头一句改说带 m 编号的那几张 decompress 也许还取得回、别的拿不回，不再整句说「decompress 拿不回图」。compress 回执附上同一段，并块时把子块的那段带上来（一块最多 16 行），decompress({ imageRef }) 取到宿主的文件图时给路径。已经建好的块、历史消息一律不改。家目录默认 os.homedir()（环境变量 BILI_HOST_HOME 能换）。也能按会话写。不认这个键的旧构建，网页设置面板的严格解析会整个 sessions 块不认——只能在装上认它的构建以后才写。不开 = 只写「原图在宿主那边」。"
+  - key: compress.epochMajorityGuard
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (companion lane): opt-in port of upstream #5737 (v0.1.214, fixes #5715) — when a strict majority of the hard ids covered by active blocks still rides verbatim on the wire, fold reconciliation never latches the epoch-confirm pause and clears a pending one. The latch only pauses preflight ghostwriting, so turning this on without noGhostwrite lets the proxy summarize on the model's behalf again when over the window. Also settable per session. Off = the 0.1.213 verdict."
+    desc_zh: "fork（养成向）：上游 #5737（v0.1.214，修 #5715）的「活着的多数」判断，默认关：活着的块盖住的硬消息严格过半仍原样在线上时，对账不置「等确认」记号，已经挂着的当场清掉。记号只挡 preflight 代写，所以没开 noGhostwrite 时打开它，越线时代理会恢复代写。也能按会话写。不开 = 0.1.213 的判断。"
+  - key: compress.requireUsageSampleForTruncate
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (companion lane): emergency truncation cuts only on a billed reading. When this turn is sized on a local ESTIMATE (the send before it was aborted and its usage never settled — the estimate then runs well above the billed size), the kernel emergency-truncate node clips nothing new: latched clips still replay byte-identically and fresh cuts wait for the next real usage report. Pressure nudges are unaffected (they have their own estimate hold, requireUsageSampleForPressure). Each held turn is counted in session metadata.truncateHeldForUsage and logged once as [truncate-hold]. Leave it off for upstreams that never report usage (they would never truncate). Maps to kernel truncate.requireUsageSample; also settable per session. Off = upstream truncation."
+    desc_zh: "fork（养成向）：紧急截断只认落了账的真用量。这一次判大小用的是本地估计时（上一份请求被掐断、用量没落账，估计值常比真用量大得多），内核的 emergency-truncate 不剪新的：已经锁住的照旧原样重放，新的等下一次真用量回来再判。催压不受影响（催压自己有估计值的等待：requireUsageSampleForPressure）。每次这样没剪都在会话 metadata.truncateHeldForUsage 里记数、日志打一行 [truncate-hold]。上游从不回用量的线路别开（那样就永远不剪了）。映射到内核 truncate.requireUsageSample；也能按会话写。不开 = 上游的截断。"
+  - key: compress.modelWindows
+    type: object
+    default: "unset"
+    group: compress
+    desc_en: "Fork (multi-model): per-model window table, read only for sessions whose compress.sessions entry sets limitMode \"input\"; global level only. Keyed by the request's model id, or \"<provider>/<model>\" (a request model matches a key exactly first, then by the part after the last slash — only when exactly one row matches; two matches apply none and warn once). Each row accepts window (integer ≥ 1000: the model's real native window; the smaller of it and the host-reported window is used), safety (0.5–1, default 0.85) and quality (integer ≥ 1000: an optional quality/speed cap). A malformed row is ignored at request time with one warn; the web panel's strict parser rejects the whole block. Unset = empty table."
+    desc_zh: "fork（多模型）：按模型的窗口表，只给 compress.sessions 里写了 limitMode \"input\" 的会话用；只在全局一级读。键是请求里的 model，或者 \"<提供方>/<model>\"（请求的 model 先整串认，再按最后一个斜杠后面那段认，只认唯一的一行；两行都对得上就都不用、打一次 warn）。每一行收 window（≥ 1000 的整数：这个模型真正的原生窗口，和宿主报的取小）、safety（0.5–1，缺省 0.85）、quality（≥ 1000 的整数：可选的质量 / 速度上限）。写坏的行请求时不生效、打一次 warn；网页面板的严格解析整块不认。不写 = 空表。"
+  - key: compress.sessions.*.limitMode
+    type: string
+    default: "\"window\" (unset)"
+    group: compress
+    desc_en: "Fork (multi-model), per session only: \"window\" = upstream judging (native window or modelContextLimit, minus the output reserve). \"input\" = judge on usable input: judgeBase = min(modelContextLimit, quality, floor(W × safety) − min(max_tokens, 0.25 × W)), W = the host-reported native window capped by the modelWindows row; this replaces the reserved window (the max_tokens clamp still guards W itself). When the host reports no native window (fallback guess or none) that request is judged with the \"window\" rules and one warn is logged. The figures land in session metadata.modelWindow and a one-time [model-window] log line."
+    desc_zh: "fork（多模型），只能按会话写：\"window\" = 和上游一样（原生窗口或 modelContextLimit，再扣输出预留）。\"input\" = 按「能用的输入」判：judgeBase = min(modelContextLimit, quality, ⌊W × safety⌋ − min(max_tokens, 0.25 × W))，W 是宿主报的原生窗口、再用 modelWindows 那一行的 window 封顶；它直接顶替扣过预留的判窗（max_tokens 的夹紧照旧守 W）。宿主没报原生窗口（只是兜底猜的或没有）时，那一份按 \"window\" 判、打一次 warn。算出来的数记在会话 metadata.modelWindow，日志打一次 [model-window]。"
+  - key: compress.sessions.*.truncateHoldAfterSwitch
+    type: integer
+    default: "0 (unset)"
+    group: compress
+    desc_en: "Fork (multi-model), per session only, 0–8: after a model switch, an upstream-route switch or a [window-change], the next N requests (this one included) clip nothing new in the kernel emergency-truncate node — latched clips still replay byte-identically and pressure nudges are still injected. Guards the request after a switch from being cut on the previous model's billed usage. State in session metadata.truncateHoldAfterSwitch, one [switch-hold] log line per held request; maps to the fork kernel flag truncate.holdFreshCuts. 0/unset = upstream truncation."
+    desc_zh: "fork（多模型），只能按会话写，0–8：换模型、换上游路线或出了 [window-change] 以后，接下来 N 份请求（含这一份）内核的 emergency-truncate 不剪新的——已经锁住的照旧原样重放，催压照旧。防的是切换后那一份按上一个模型落账的用量被剪。状态在会话 metadata.truncateHoldAfterSwitch，每份按住的请求打一行 [switch-hold]；对应 fork 内核的 truncate.holdFreshCuts。0 / 不写 = 上游的截断。"
+  - key: compress.sessions.*.anthropicThinkingBinding
+    type: string
+    default: "\"off\" (unset)"
+    group: compress
+    desc_en: "Fork (multi-model), per session only: \"strip_retry\" = when an Anthropic-protocol upstream answers 400 \"Invalid `signature` in `thinking` block … bound to a different conversation\", the proxy removes every thinking / redacted_thinking block from assistant messages of that outbound copy and resends once (a thinking-only assistant message is left out; never when the last message is thinking only, never for a plain bad-signature 400). When the last message is a tool_result turn and its assistant turn lost its thinking, the resend also drops the top-level thinking parameter (Anthropic requires that turn to start with a thinking block while thinking is on), so that one request runs without thinking. The session and the ledger keep the originals. Counted in session metadata.thinkingStrip, logged as [thinking-strip], the resend is a fish-ledger egress row with reason thinking-strip. \"off\" = the 400 passes through."
+    desc_zh: "fork（多模型），只能按会话写：\"strip_retry\" = Anthropic 协议的上游回 400「Invalid `signature` in `thinking` block … bound to a different conversation」时，把这一份外发副本里 assistant 消息的 thinking / redacted_thinking 全去掉、只重发一次（只有思考的 assistant 消息整条不发；最后一条就是只有思考的那种时不重发；只是签名坏了的 400 不管）。最后一条是带 tool_result 的 user、而它前面那轮 assistant 的思考被去掉了时，重发的这一份连顶层 thinking 参数一起去掉（开着 thinking 时 Anthropic 要求这一轮以思考块开头），也就是这一份不思考。会话和账本里的原文不动。会话 metadata.thinkingStrip 记数，日志打 [thinking-strip]，重发在证据账里是一条 reason thinking-strip 的出口行。\"off\" = 400 原样回给客户端。"
+  - key: compress.sessions.*.openaiReasoningAliases
+    type: boolean
+    default: "off (unset)"
+    group: compress
+    desc_en: "Fork (multi-model), per session only: on the OpenAI chat-completions lane, read an assistant message's `reasoning` / `reasoning_text` field (newer vLLM, some gateways) as reasoning when `reasoning_content` is absent, so it is estimated and foldable like reasoning_content; on the way out each kept reasoning is written back under its original field name. Also skips the watermark fast path for that session. Off = only reasoning_content is read (upstream; other fields are dropped from the rebuilt outbound)."
+    desc_zh: "fork（多模型），只能按会话写：OpenAI chat-completions 线上，assistant 消息没有 `reasoning_content` 时，把 `reasoning` / `reasoning_text` 字段（vLLM 新版、有的网关这样回）当成思考来认，和 reasoning_content 一样估算、能折；外发时留下的思考写回原来的字段名。这个会话不走水位线快路。不开 = 只认 reasoning_content（和上游一样；别的字段在重建的外发里会丢掉）。"
   - key: compress.streamSummary
     type: boolean
     default: "false (unset)"
@@ -390,6 +456,19 @@ entries:
     desc_zh: "开启后 search_context 候选按当前计划状态重排；关闭时结果逐字节不变。"
     site_en: "<code>search.planAware</code> — off by default: when on, search_context candidates are re-ranked against current plan state (latest-wins todos + last user turn); off keeps byte-identical lexical results."
     site_zh: "<code>search.planAware</code> —— 默认关：开启后 search_context 候选按当前计划状态重排（todo 最新优先 + 上一轮用户消息）；关闭时结果逐字节不变。"
+  - key: compress.search.engine
+    type: "\"substring\" | \"cjk\""
+    default: "unset (= substring)"
+    default_zh: "unset（= substring）"
+    group: compress
+    desc_en: "fork: `\"cjk\"` answers own-session search_context from a CJK unigram+bigram BM25 index over the unified store's message rows (excerpts with speaker labels); unset / `\"substring\"` keeps the old lexical path byte-identical. A v2 field with the wrong type or a regex that does not compile turns the engine (and `around`) off for the request; the rest of the config is unaffected."
+    desc_zh: "fork：`\"cjk\"` 时本会话的 search_context 改由统一库消息行上的中文单字+双字 BM25 索引回答（带说话人的原话摘录）；不设或 `\"substring\"` 走旧路，逐字节不变。v2 的字段类型不对、或正则编译不过时，这一次请求里 engine（和 `around`）按关处理，别的配置不受影响。"
+  - key: compress.search.around
+    type: boolean
+    default: "false"
+    group: compress
+    desc_en: "fork: advertise the optional `around` param on search_context in the plugin manifest and serve it (messages around one mNNNNN of the same chat); independent of `engine`."
+    desc_zh: "fork：插件清单里给 search_context 加可选参数 `around`（同一处聊天里某条 mNNNNN 前后的原话）；和 `engine` 互不依赖。"
   - key: compress.prompts
     type: "Partial<Prompts>"
     default: "unset (kernel doctrine)"

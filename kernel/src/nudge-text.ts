@@ -297,7 +297,15 @@ export function renderNudgeText(
       ? `[EMERGENCY — TIER ${decision.tier} ${isT2 ? "DISTILLATION" : "CONDENSATION"}] Context limit reached — distill NOW into a denser summary to reclaim tokens.`
       : `[TIER ${decision.tier} ${isT2 ? "DISTILLATION" : "CONDENSATION"} TRIGGER]`;
     const guidance = tierGuidance(isT2 ? 2 : 3, sections);
-    const head = efficiencyNote(prompts, sections);
+    // fork: an EMERGENCY tier nudge opens with the pack's own emergency header
+    // when the pack supplies one — the efficiency note says "not an overflow
+    // warning, a stronger alert will appear when it is actually full", which
+    // contradicts the "[EMERGENCY …] Context limit reached" line right below
+    // it. Without a pack-supplied emergencyHeader (every builtin pack, and the
+    // default) the head stays the efficiency note, byte for byte as upstream.
+    const head = isEmergency && sections.emergencyHeader !== undefined
+      ? emergencyHeader(prompts, sections)
+      : efficiencyNote(prompts, sections);
     return {
       voice,
       text: compact([

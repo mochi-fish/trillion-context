@@ -59,7 +59,10 @@ import { detectStaleInstall, isVersionNewer } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { pckNoticeActive } from "./pck-notice.js";
-import { PACKAGE_NAME, VERSION } from "./version.js";
+import { BUILD_COMMIT, PACKAGE_NAME, VERSION } from "./version.js";
+import { startFishLedger, stopFishLedger } from "./fish-ledger.js";
+import { setFishDateNotes } from "./fish/date-notes.js";
+import { noteSideUsage } from "./fish-ledger-usage.js";
 import {
     coreToGoogle,
     googleToCore,
@@ -78,12 +81,13 @@ import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetr
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { armAutoFoldBackoff, autoFoldFloor, autoFoldWanted, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { NO_GHOSTWRITE_MIN_OUTPUT, noGhostwriteOn, noteGhostwriteBlocked, noteGhostwriteOutputClamped } from "./no-ghostwrite.js";
 import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteFishEgress, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
@@ -153,9 +157,9 @@ import { connectionNamedHeaders, NO_IDENTITY_MESSAGE, stripRemoteCompactionBetaF
 import { installWebSocketBridge } from "./ws-bridge.js";
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
-import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
+import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools, writeOutputBudget, type OutputBudgetField } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
+import { clampOutgoingOutput, clampOutputBudget, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, readOutputBudget } from "./server/budget.js";
 import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -520,6 +524,8 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     const core = createCore(resolveMessageTimestamps(opts.compress) ? { timestamps: true } : undefined);
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // fork（日期）：fish.dateNotes（没写 = 关，一个文件都不读）；reload / 设置页保存再换
+    setFishDateNotes(opts.fish?.dateNotes);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound
     // forwards. Per-server (not module-level) so two servers in one process
     // (tests) are distinct instances; a restart changing the id is harmless
@@ -1257,6 +1263,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // announcing would register a dead listener under the configured port
         // (port 0 → bogus http://host:0 banners/registry records); skip entirely.
         if (server.address() === null) return;
+        // fish-ledger P0: open the local evidence ledger's proxy writer once
+        // the listener is really ours (a twin that exits before binding never
+        // takes the lock). No root / no proxy/enabled ⇒ it opens nothing.
+        startFishLedger({ version: VERSION, commit: BUILD_COMMIT });
         const actualPort = (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
@@ -1717,6 +1727,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         flushPrefixAffinity();
         flushOrderSkeletons();
         servedWriter?.dispose();
+        stopFishLedger("exit");
         clearProxyInstanceFile(instanceId);
         unregisterInstance(instanceId);
         closeLogger();
@@ -1903,6 +1914,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
 
 export type Prepared = {
     body: string | Buffer;
+    /** fork (M8): the alias fields this request's openaiToCore read as
+     *  reasoning_content (session openaiReasoningAliases). The invariant judge
+     *  re-parses the exit body with the same aliases. Absent = upstream. */
+    openaiReasoningAliases?: readonly string[];
     /** The pre-serialization form of `body` when the lane built it as an
      *  object (every prepare-* does: `body` is JSON.stringify(rebuilt)).
      *  Consumers that would re-parse the string (image walk, overhead
@@ -3235,12 +3250,16 @@ export async function runNudgeDecision(args: {
                 log("warn", `[acp-decide] session=${session.id} re-sign failed; sending the previous signature: ${String(err)}`);
             }
         }
+        // fish-ledger P0 (egress, lane side): the nudge-timing side call.
+        noteFishEgress({ lane: "side", reason: "nudge-decide", body: bodyStr, upstreamUrl: url, model: typeof sideBody.model === "string" ? sideBody.model : undefined, sid: session.id });
         const { response, clearTimer } = await fetchWithTimeout(url, { method: "POST", headers, body: bodyStr, dispatcher: proxyDispatcher(target.proxyUrl) }, DECIDE_TIMEOUT_MS);
         try {
             if (!response.ok) {
                 outcome = { kind: "failed", detail: `HTTP ${response.status}` };
             } else {
                 const text = await response.text();
+                // fish-ledger P0 (usage, lane side): the decision call's own usage.
+                noteSideUsage({ protocol, text, sid: session.id, upstreamUrl: url, model: typeof sideBody.model === "string" ? sideBody.model : undefined });
                 let json: Record<string, unknown> | null = null;
                 try {
                     json = JSON.parse(text) as Record<string, unknown>;
@@ -3592,7 +3611,8 @@ export function outboundContextEstimates(
     const project = (value: unknown): void => {
         switch (prepared.protocol) {
             case "anthropic": msgs = anthropicToCore(value as AnthropicRequestBody).msgs; break;
-            case "openai": msgs = openaiToCore(value as OpenAIRequestBody).msgs; break;
+            // fork（多模型，M8）：会话开了 openaiReasoningAliases 时，估外发也照同一套别名读（没开 = 上游的调法）
+            case "openai": msgs = (prepared.openaiReasoningAliases !== undefined ? openaiToCore(value as OpenAIRequestBody, { reasoningAliases: prepared.openaiReasoningAliases }) : openaiToCore(value as OpenAIRequestBody)).msgs; break;
             case "responses": msgs = responsesToCore(value as ResponsesRequestBody).msgs; break;
             case "google": msgs = googleToCore(value as GoogleRequestBody).msgs; break;
         }
@@ -3713,7 +3733,7 @@ export function warnModelNameMissIfNew(
  *  upstream matched NO configured providers key (so the operator's pinned window was
  *  never consulted — advising "set modelContextLimit" would be wrong). */
 export function buildWindowShrinkNote(args: {
-    reason: "operator" | "codex" | undefined;
+    reason: "operator" | "session" | "codex" | undefined;
     limit: number;
     nativeWindow?: number;
     routeMissedConfigured?: boolean;
@@ -3724,6 +3744,11 @@ export function buildWindowShrinkNote(args: {
     const head = ` Note: bili's effective window ${args.limit} is below the model's full window ${args.nativeWindow} — `;
     if (args.reason === "operator") {
         return head + `your compress.modelContextLimit setting overrides it; if the upstream actually serves the larger window, raise or remove that setting (hot-reloaded, no session restart needed).`;
+    }
+    // fork: the per-session cap (compress.sessions.<id>.modelContextLimit) is
+    // operator-owned too, but lives under a different key.
+    if (args.reason === "session") {
+        return head + `this session's compress.sessions entry sets modelContextLimit; if that cap is too tight, raise or remove it there (the compress block takes effect on the settings panel's Apply or a proxy restart).`;
     }
     if (args.routeMissedConfigured) {
         const up = args.upstreamEndpoint ? hostIdForLog(args.upstreamEndpoint) : "this upstream";
@@ -3745,7 +3770,7 @@ export async function preflightCompressIfNeeded(
     configuredWindow: number,
     model: string | undefined,
     resolvedNativeWindow: number | undefined,
-    windowShrinkReason: "operator" | "codex" | undefined,
+    windowShrinkReason: "operator" | "session" | "codex" | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
     anonymous: boolean,
@@ -3816,7 +3841,11 @@ export async function preflightCompressIfNeeded(
     // compression plans. Fail-open rule: every FAIL-FAST below is an
     // overflow concept — a growth-armed payload still fits the real window,
     // so failures forward as-is instead of refusing the request.
-    const autoFoldOn = autoFoldEngaged(config, session);
+    // fork: no-ghostwrite disengages auto-fold. The growth target is still
+    // computed from the operator's wish (autoFoldWanted) so the suppressed
+    // growth folds can be counted below; growthArmed itself stays false.
+    const noGhostwrite = noGhostwriteOn(config);
+    const autoFoldOn = autoFoldWanted(config, session);
     // The implicit half-window default must respect the documented
     // [8192, 10M] target range too: a window below ~16K would otherwise arm a
     // floor under the documented minimum. Clamping to the minimum disarms
@@ -3835,7 +3864,8 @@ export async function preflightCompressIfNeeded(
     const autoFoldTarget = autoFoldOn
         ? Math.min(Math.max(Math.max(AUTO_FOLD_TARGET_MIN, Math.min((config as ResolvedKernelConfig).externalSummary?.autoFoldTargetTokens ?? (overflowTarget > 0 ? Math.round(overflowTarget / 2) : 0), overflowTarget)), measuredFloor ?? 0), overflowTarget)
         : undefined;
-    const growthArmed = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
+    const growthWanted = autoFoldOn && autoFoldTarget !== undefined && autoFoldTarget > 0 && autoFoldTarget < overflowTarget; // narrowing form of growthFoldingArmed(config, overflowTarget, measuredFloor) — keep in sync (PR #2581 review)
+    const growthArmed = growthWanted && !noGhostwrite;
     const compressionTarget = growthArmed ? autoFoldTarget : overflowTarget;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
@@ -3927,6 +3957,19 @@ export async function preflightCompressIfNeeded(
     // not foldable, so their overage is not "expected benefit" at all.
     const growthWorthIt = !growthArmed || imageTokens >= compressionTarget || decisionTrigger - textBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS;
     const triggerFires = growthWorthIt && (imageTokens >= compressionTarget || decisionTrigger >= textBudget);
+    // fork: count the growth fold no-ghostwrite suppressed — same trigger math
+    // as the armed path above, evaluated against the would-be growth target.
+    // An overflow trigger (triggerFires) is counted by preflightCompress itself.
+    if (noGhostwrite && growthWanted && !triggerFires && autoFoldTarget !== undefined) {
+        const growthBudget = Math.max(0, autoFoldTarget - imageTokens);
+        const growthWouldFire = (imageTokens >= autoFoldTarget || decisionTrigger >= growthBudget)
+            && (imageTokens >= autoFoldTarget || decisionTrigger - growthBudget >= AUTO_FOLD_MIN_BENEFIT_TOKENS);
+        if (growthWouldFire && limit > 0 && model) {
+            const counts = noteGhostwriteBlocked(session, "autoFold");
+            markDirty(session);
+            log("warn", `[${session.id}] [no-ghostwrite] auto-fold growth target ${autoFoldTarget} reached (~${Math.round(decisionTrigger)} text tokens) — NOT folding on the model's behalf (autoFold blocked ${counts.autoFold}×); the nudge carries the request`);
+        }
+    }
     // #2283 sub-defect 2: pair upstream billing with the same-payload local estimate on
     // EVERY request (not only when preflight triggers) — the offline data source for the
     // chars/4 deviation distribution behind the #2273 RC2 calibration decision.
@@ -4297,6 +4340,75 @@ export async function preflightCompressIfNeeded(
         const detail = f?.kind === "aborted" ? f.detail : "the client disconnected during preflight compression";
         log("warn", `[${session.id}] preflight aborted (${detail}); not forwarding`);
         return { failFast: true, status: 0, message: detail, retryable: false, respond: false };
+    }
+    // fork: no-ghostwrite stopped the walk (nothing was summarized on the
+    // model's behalf) and the payload is over the configured window. The
+    // configured window is a SOFT cap here, and the decision is taken HERE, on
+    // the trigger's calibrated caliber — ahead of the generic raw-estimate fit
+    // check below, which could wave through a full output budget that no
+    // longer fits. Without a per-session cap the trigger line (window minus
+    // the output reservation) and the "fits with its budget" line coincide,
+    // so a plain "forward or 413" left a zero-width band: the first crossing
+    // was already a 413, and every turn after it too. So:
+    //   1. payload + this request's output budget fit the real wall → forward
+    //      as-is (a compress nudge rides the request when the meter asks);
+    //   2. the payload fits but its output budget does not → shrink THIS
+    //      request's budget to the room that is left (clampOutputBudget's
+    //      margin + estimate safety; never below NO_GHOSTWRITE_MIN_OUTPUT, so
+    //      the model can still answer with a compress call) and forward;
+    //      counted as metadata.noGhostwrite.outputClamped;
+    //   3. not even that fits → 413 (retryable=false), still never a summary.
+    // The wall is the model's real window capped by an upstream-stated wall
+    // (overflow arm): that number is the TOTAL the provider takes for
+    // messages + completion, so payload + budget is compared to it directly.
+    // Planning input is the larger of the calibrated payload and the route's
+    // own upstream evidence (usage / overflow-arm baseline) — a low local
+    // estimate must not talk the clamp into a budget the upstream rejects
+    // (after an overflow 400 this is what lets the #1195 refold re-send a
+    // body that fits instead of re-sending the same overflow).
+    // A #3846 local-refusal record keeps blocking these forwards only when the
+    // payload does not fit the judging window by its raw estimate either
+    // (`fits`) — the old order forwarded every `fits` payload regardless.
+    if (result.ghostwriteBlocked === true) {
+        let ngBody: Record<string, unknown> | undefined;
+        let ngField: OutputBudgetField | null = null;
+        let ngBudget = 0;
+        try {
+            const parsedNg: unknown = JSON.parse(typeof outbound.body === "string" ? outbound.body : outbound.body.toString("utf8"));
+            if (parsedNg !== null && typeof parsedNg === "object" && !Array.isArray(parsedNg)) {
+                ngBody = parsedNg as Record<string, unknown>;
+                ngField = outputBudgetField(ngBody);
+                const ngRaw = ngField !== null ? readOutputBudget(ngBody, ngField) : undefined;
+                if (typeof ngRaw === "number" && ngRaw > 0) ngBudget = ngRaw;
+            }
+        } catch {
+            ngBody = undefined;
+        }
+        const nativeWall = typeof resolvedNativeWindow === "number" && resolvedNativeWindow > 0 ? resolvedNativeWindow : limit;
+        const realWall = Math.min(nativeWall, statedWall > 0 ? statedWall : Number.POSITIVE_INFINITY);
+        const planningInput = Math.max(calibratedPayload, baselineFloor);
+        const mayForward = !localRefusalHere || fits;
+        if (mayForward && planningInput + ngBudget <= realWall) {
+            log("info", `[${session.id}] [no-ghostwrite] payload ~${Math.round(planningInput)} tok is over the configured window ${limit} but fits the model's real wall ${realWall} with its output budget ${ngBudget} — forwarding as-is; the proxy does not fold on the model's behalf`);
+            return outbound;
+        }
+        if (mayForward && ngBody !== undefined && ngField !== null && ngBudget > 0) {
+            const capped = clampOutputBudget(ngBudget, planningInput, realWall);
+            if (capped !== undefined && capped >= NO_GHOSTWRITE_MIN_OUTPUT) {
+                writeOutputBudget(ngBody, ngField, capped);
+                const clampedText = JSON.stringify(ngBody);
+                const clampedOut: Prepared = { ...outbound, body: typeof outbound.body === "string" ? clampedText : Buffer.from(clampedText, "utf8"), parsedBody: ngBody };
+                session.stats.lastOutputClamp = { raw: ngBudget, capped, window: realWall, planningInput: Math.round(planningInput), ledgerFloor: 0, at: Date.now() };
+                const counts = noteGhostwriteOutputClamped(session);
+                markDirty(session);
+                log("warn", `[${session.id}] [no-ghostwrite] payload ~${Math.round(planningInput)} tok fits the model's real wall ${realWall} but not with its output budget ${ngBudget} — output budget clamped ${ngBudget} -> ${capped} for this request and forwarded; the proxy does not fold on the model's behalf (outputClamped ${counts.outputClamped}×)`);
+                return clampedOut;
+            }
+        }
+        const ngWhy = mayForward
+            ? `the payload (~${Math.round(planningInput)} tok) leaves less than ${NO_GHOSTWRITE_MIN_OUTPUT} tokens of output room in the model's real wall ${realWall} (requested output budget ${ngBudget})`
+            : `this origin/model was already refused locally (413) at an equal or wider window and the payload (~${Math.round(planningInput)} tok) does not fit the judging window by its own estimate either (#3846)`;
+        return failFast(413, `no-ghostwrite is on for this session, so the proxy will not summarize on the model's behalf, and ${ngWhy}`, false);
     }
     if (fits) {
         if (result.compressedRanges === 0) {

@@ -20,7 +20,8 @@
 // persistence.
 
 import { findRoute, loadConfigFile, resolveModelEntryOnRoute, type CacheKeepaliveSettings, type ProviderRoutes } from "./config.js";
-import { credentialFingerprint } from "./cache-ledger.js";
+import { credentialFingerprint, noteFishEgress } from "./cache-ledger.js";
+import { noteSideUsage } from "./fish-ledger-usage.js";
 import { log as loggerLog } from "./logger.js";
 import { peekSession } from "./session.js";
 import { usageTotals, type WireProtocol } from "./util.js";
@@ -379,6 +380,8 @@ async function firePing(entry: KeepaliveEntry): Promise<void> {
     entry.pingInFlight = false;
     if (registry.get(entry.sessionId) !== entry) return;
     const text = await resp.text().catch(() => "");
+    // fish-ledger P0 (usage, lane side): the ping is a billed model call.
+    if (resp.ok) noteSideUsage({ protocol: "anthropic", text, sid: entry.sessionId, upstreamUrl: entry.upstreamUrl });
     if (!resp.ok) {
         if (resp.status === 429) {
             disarm(entry.sessionId, "rate-limited(429)");
@@ -434,10 +437,13 @@ async function sendPing(entry: KeepaliveEntry): Promise<Response> {
     // Same dispatcher typing as fetch-util.ts: @types/node types
     // RequestInit.dispatcher as its internal Dispatcher interface; undici's
     // global accepts it at runtime. Assert to RequestInit at the call site.
+    const pingBody = buildPingBody(entry.body);
+    // fish-ledger P0 (egress, lane side): the proxy's own cache keep-alive ping.
+    noteFishEgress({ lane: "side", reason: "cache-keepalive", body: pingBody, upstreamUrl: entry.upstreamUrl, sid: entry.sessionId });
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: "POST",
         headers,
-        body: buildPingBody(entry.body),
+        body: pingBody,
         signal: AbortSignal.timeout(PING_TIMEOUT_MS),
     };
     if (entry.dispatcher) init.dispatcher = entry.dispatcher;

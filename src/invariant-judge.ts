@@ -455,6 +455,9 @@ export function judgeInboundOutbound(
 // never mutates the body or throws out. Owner design: #3842, enablement
 // decision recorded in #3938.
 interface InvariantJudgeInput {
+  /** fork (M8): the alias fields prepare read as reasoning_content — the exit
+   *  body is re-parsed with the same aliases (absent = upstream parse). */
+  openaiReasoningAliases?: readonly string[];
   /** Inbound cores (what the client sent) — already computed by prepare. */
   originalMessages?: readonly CoreMessage[];
   /** Outbound request body (the exact bytes forwarded) — re-parsed to core here. */
@@ -478,7 +481,7 @@ interface InvariantJudgeInput {
 // snapshots diverges for reasons unrelated to the invariant (token estimation,
 // ref re-minting, ordering repairs). Same codec on both sides ⇒ directly
 // comparable and wire-neutral, which is also what makes cross-wire work.
-function parseExitCores(body: string | Buffer | undefined, protocol: string | undefined, parsed?: Record<string, unknown> | null): CoreMessage[] | null {
+function parseExitCores(body: string | Buffer | undefined, protocol: string | undefined, parsed?: Record<string, unknown> | null, reasoningAliases?: readonly string[]): CoreMessage[] | null {
   if (!body || !protocol) return null;
   let value: unknown = parsed;
   if (value === undefined) {
@@ -487,7 +490,7 @@ function parseExitCores(body: string | Buffer | undefined, protocol: string | un
   }
   try {
     switch (protocol) {
-      case "openai": return openaiToCore(value as Parameters<typeof openaiToCore>[0]).msgs;
+      case "openai": return (reasoningAliases !== undefined ? openaiToCore(value as Parameters<typeof openaiToCore>[0], { reasoningAliases }) : openaiToCore(value as Parameters<typeof openaiToCore>[0])).msgs;
       case "anthropic": return anthropicToCore(value as Parameters<typeof anthropicToCore>[0]).msgs;
       case "responses": return responsesToCore(value as Parameters<typeof responsesToCore>[0]).msgs;
       case "google": return googleToCore(value as Parameters<typeof googleToCore>[0]).msgs;
@@ -538,7 +541,7 @@ export function maybeRunInvariantJudge(input: InvariantJudgeInput): void {
   if (!armed()) return;
   try {
     const entry = input.originalMessages ?? [];
-    const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed);
+    const exitCores0 = parseExitCores(input.body, input.protocol, input.parsed, input.openaiReasoningAliases);
     if (!exitCores0) return; // unparseable/unknown wire → skip, never false-positive
     const exitCores = fault ? fault([...exitCores0]) : exitCores0;
     const v = judgeInboundOutbound(entry, exitCores, { renderTailStart: input.renderTailStart });

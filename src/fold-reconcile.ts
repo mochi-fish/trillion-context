@@ -199,6 +199,10 @@ const METADATA_TRUNC_NOTED = "foldTruncationNoted";
  *  resent wire is a prefix-cut of the pre-rewind wire). Same benign class as
  *  head truncation; a distinct key so the log can name which end moved. */
 const METADATA_TAIL_TRUNC_NOTED = "foldTailTruncationNoted";
+/** #5715: one-per-episode info latch for the surviving-direct-ID-majority
+ *  partial-loss verdict (cleared with the rest of the drift state on recovery,
+ *  like the #3641/#3724 benign latches). */
+const METADATA_MAJORITY_LOSS_NOTED = "foldMajorityLossNoted";
 /** #3641: the wire order frozen at the moment the drift episode began — the
  *  baseline against which truncation-vs-replacement is decided. */
 const METADATA_EPISODE_ORDER = "foldEpisodeOrder";
@@ -338,6 +342,7 @@ function resetFoldDriftState(session: Session): void {
     delete md[METADATA_SHAPE_NOTED];
     delete md[METADATA_TRUNC_NOTED];
     delete md[METADATA_TAIL_TRUNC_NOTED];
+    delete md[METADATA_MAJORITY_LOSS_NOTED];
     delete md[METADATA_EPISODE_ORDER];
     // #5142: the expected-rebase RECORD itself (METADATA_EXPECTED_REBASE) is
     // id-level truth and survives episodes on purpose; only its one-shot log
@@ -1683,6 +1688,18 @@ export interface ReconcileOptions {
       *  persisted, see the channel-2 note). Invoked only on drift passes
       *  (≤256 ids/pass); undefined = legacy mode, channels 2+3 stay silent. */
     storedRowLookup?: (msgIds: readonly string[]) => Array<{ seq: number; msgId: string; content: string }> | null;
+    /** fork: compress.epochMajorityGuard (upstream #5737, v0.1.214) — let a
+     *  surviving direct-ID majority void the terminal epoch-confirm verdict and
+     *  clear a pending latch. Unset/false = the 0.1.213 verdict, byte for byte
+     *  (the majority is never consulted). Callers pass epochMajorityGuardOn(config). */
+    majorityGuard?: boolean;
+}
+
+/** fork: true only when the request's resolved Config carries
+ *  `epochMajorityGuard: true` (compress.epochMajorityGuard, three-level or
+ *  per-session). Anything else is OFF — 0.1.213 behavior. */
+export function epochMajorityGuardOn(config: unknown): boolean {
+    return (config as { epochMajorityGuard?: unknown } | undefined)?.epochMajorityGuard === true;
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1697,8 +1714,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     // Active coverage first (the anchor cap's survivor order, #2334), then the
     // retained view-deactivated lineage re-fed into the claim ladder (#4050);
-    // see recoveryCandidateIds for what is excluded and why.
-    const covered = coveredIdsOf(blocks);
+    // see recoveryCandidateIds for what is excluded and why. activeCovered keeps
+    // the active-only caliber intact (a separate object, never mutated) so the
+    // #5715 surviving-majority test below can run on live substrate alone.
+    const activeCovered = coveredIdsOf(blocks);
+    const covered = new Set(activeCovered);
     for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
@@ -2166,6 +2186,42 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         && plan.nearDupResidual.length === 0
         && classCarryingResidual.every((id) => absentSet.has(id))
         && tailTruncated;
+    // #5715: a strict majority of hard-covered ids still PRESENT VERBATIM on
+    // the wire is the opposite of wholesale replacement — the fold substrate
+    // is alive. The verdict classifier above only sees claims==0 + unmatched>0
+    // and never counts the surviving direct matches, so a handful of interior
+    // edits/deletions (neither a head cut nor a tail rewind) read as total
+    // drift and, after FOLD_DRIFT_ESCALATE_PASSES, falsely latch epoch-confirm
+    // and pause compression on a healthy session. We deliberately do NOT relax
+    // totalDrift itself: the #3641 drift streak + frozen witness are what keep
+    // a genuine mid-history edit reading as honest loss (zombie accrual)
+    // rather than sanctioned truncation (#4050/#2695). The surviving majority
+    // only voids the TERMINAL verdict (below). The base is ACTIVE coverage only
+    // (the coveredIdsOf caliber), NOT the full `covered`: the #4050 view-
+    // deactivated lineage re-fed via recoveryCandidateIds is recoverable-but-
+    // gone, and its legitimate post-rewind/post-drift absence must never be able
+    // to dilute a healthy active majority below the bar (#5715 field report).
+    // Denominators match the per-block coverage (separators / expected rebases /
+    // reasoning cores excluded); the bar is >= MIN_RESYNC_RUN and > half.
+    // Genuine wholesale replacement has ~0 directly-present ACTIVE covered ids,
+    // so this can never mask a real collapse.
+    let coveredHard = 0;
+    let presentHard = 0;
+    for (const id of activeCovered) {
+        if (isResponsesTurnSeparatorId(id) || expected[id] !== undefined || anchors[id]?.c === "reasoning") continue;
+        coveredHard++;
+        if (byId.has(id)) presentHard++;
+    }
+    // fork: the whole #5737 judgment is opt-in (compress.epochMajorityGuard);
+    // off, hardDirectMajority stays false and every branch below reads exactly
+    // as in 0.1.213.
+    const hardDirectMajority = opts.majorityGuard === true && presentHard >= MIN_RESYNC_RUN && 2 * presentHard > coveredHard;
+    // #5715: a strict direct-ID majority proves the fold substrate is alive on
+    // the wire — any pending epoch-confirm latch is stale (the histories
+    // realigned) and clears immediately, whether or not this pass still carries
+    // residual loss (a partial restore keeps totalDrift true, so the normal
+    // !totalDrift reset below would never fire for it).
+    if (hardDirectMajority && epochConfirmPending(session)) resetFoldDriftState(session);
     const totalDrift = plan.claims.size === 0 && realUnmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained
         && !shapeExplained && !truncationExplained && !tailTruncationExplained;
     // Classify before reaping: the epoch-confirm gate promises to retain the
@@ -2362,7 +2418,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         session.metadata[METADATA_DRIFT_STREAK] = streak;
         if (prevStreak === 0) session.metadata[METADATA_DRIFT_SINCE] = Date.now();
-        if (streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+        // #5715: a strict direct-ID majority means the fold substrate is alive
+        // on the wire — this is partial loss, not wholesale replacement, so the
+        // terminal epoch-confirm verdict (and its compression pause) must not
+        // fire even though the #2193 streak above has accrued.
+        if (!hardDirectMajority && streak >= FOLD_DRIFT_ESCALATE_PASSES && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
                 && session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             session.metadata[METADATA_DRIFT_ESCALATED] = true;
             // #2709: take a ledger action at the destruction point (not just log) — attribute
@@ -2416,6 +2476,21 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
                 session.metadata[METADATA_MARKER_CHURN_NOTED] = true;
                 opts.log("info",
                     `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing with no anchor match${expectedNote}, but this pass stripped ${opts.markerStripped} raw marker artifact(s) — covered ids minted from marker-laden bytes churn once the strip engine cleans the resent history; benign on stateless resend (content still on the wire, re-folds re-cover), tolerated (#2815/#2789)`);
+            }
+        } else if (hardDirectMajority && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED
+                && !shapeExplained && !truncationExplained && !tailTruncationExplained) {
+            // #5715: a surviving direct-ID majority AT THE MASS BAR is PARTIAL
+            // loss, not the "fold silently lost" the generic warn below names —
+            // report it once per episode at info level (acceptance, not repair).
+            // Sub-mass-bar single edits keep the honest per-pass warn below. The
+            // #3641 verdict above already kept this from latching epoch-confirm.
+            // Already-explained episodes (shape churn / head / tail truncation)
+            // own their own one-per-episode note — reporting them here too would
+            // print a second line mislabeling a head/tail cut as "interior"
+            // loss, so they fall through to the original per-pass warn.
+            if (session.metadata[METADATA_MAJORITY_LOSS_NOTED] !== true) {
+                session.metadata[METADATA_MAJORITY_LOSS_NOTED] = true;
+                opts.log("info", `${tag}[fold-reconcile] ${realUnmatched.length} covered id(s) missing but ${presentHard}/${coveredHard} hard-covered id(s) still ride verbatim on the wire — partial interior loss, fold substrate healthy, no epoch confirmation (#5715)`);
             }
         } else if (session.metadata[METADATA_DRIFT_ESCALATED] !== true) {
             // #2297: once the episode escalated, the single error line IS the

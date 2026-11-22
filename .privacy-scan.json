@@ -1,0 +1,10 @@
+{
+  "$comment": "tools/privacy-scan 的公开配置（发布前的隐私扫描用）。",
+  "allow": [
+    {
+      "path": "tests/fish-host-image-paths.test.ts",
+      "rule": "user-path",
+      "reason": "合成的 Windows 8.3 短名路径（C:UsersUSER~1…），测的是短名不被认成家目录"
+    }
+  ]
+}

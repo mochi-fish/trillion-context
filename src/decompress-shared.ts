@@ -18,6 +18,8 @@ import {
     type SearchResult,
 } from "acp-kernel";
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { fishDateNotesWanted, noteDecompress } from "./fish/date-notes.js";
+import { fishOccExt, fishRowSource } from "./fish/store-readers.js";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -28,6 +30,7 @@ import { safePrefix } from "./text-safe.js";
 import { decompressTmpCap as knobDecompressTmpCap } from "./knobs.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 import { describeRestorable } from "./image-restore.js";
+import { hostImageNoPathMap, hostImagePathEnv, hostImagePathsOfMessage, hostImagePathsOn, hostImageRestoreFailedText, noteHostImagePaths } from "./host-image-paths.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -244,21 +247,35 @@ export function resolveDecompress(
     }
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
-    const toFileOut = toFilePointer(args, ctx, header, body);
+    // fork（日期，D5）：fish.dateNotes 开着时，块里的对话逐条用自己的锚点加「（=日期）」注记（工具执行时，
+    // 不在内核 render-refs 里，也不改缓存的 blockContents）；关着、或一处都没标时 body 一个字节不变。
+    // 走不走临时文件照旧按原文长度判；文件（toFile / 临时文件）开头写图例，inline 写在正文后面。
+    const rawLen = body.length;
+    let dateLegend = "";
+    if (fishDateNotesWanted()) {
+        const nd = noteDecompress(ctx.session.id, ctx.session.state, block.effectiveMessageIds, body, fishRowSource, fishOccExt, fishRowSource);
+        if (nd) {
+            body = nd.body;
+            dateLegend = nd.legend;
+        }
+    }
+    const fileBody = dateLegend ? `${dateLegend}\n${body}` : body;
+    const toFileOut = toFilePointer(args, ctx, header, fileBody);
     if (toFileOut !== null) return toFileOut;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-    const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
+    const outPath = rawLen > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {
         try {
             mkdirSync(dirname(outPath), { recursive: true });
-            writeFileSync(outPath, body, { encoding: "utf8", mode: 0o600 });
+            writeFileSync(outPath, fileBody, { encoding: "utf8", mode: 0o600 });
             trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
             reapTempFiles();
-            return toolOk(`${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
+            return toolOk(`${header}\nContent (${fileBody.length} chars) written to: ${outPath}\nUse the read tool to access it.`);
         } catch (e) {
-            return exportFailureReceipt(outPath, e, body);
+            return exportFailureReceipt(outPath, e, fileBody);
         }
     }
+    if (dateLegend) body = `${body}\n\n${dateLegend}`;
     // #398/#403 + #1294 P2 wiring (dedup of #1316 × #1298): a successful INLINE
     // whole-block restore hands the block's re-summarization material back to
     // the model via this tool result, and the client keeps tool results in its
@@ -303,6 +320,34 @@ function resolveImageRestore(args: Record<string, unknown>, ctx: ProxyToolCtx): 
     }
     const imgs = index.get(raw);
     if (!imgs || imgs.length === 0) {
+        // fork: the file-sourced wording only when compress.foldHostFileImages is
+        // on — this receipt lands in the model's history (a tool result), so with
+        // the switch off it must stay upstream's text byte for byte.
+        if ((ctx.config as { foldHostFileImages?: unknown } | undefined)?.foldHostFileImages === true) {
+            // fork (compress.foldHostFileImagePaths): the ref names a message in
+            // this request's history whose images the HOST keeps a read-only
+            // normalized copy of — hand back that copy's `~/…` path for
+            // read_image instead of a dead end (old blocks' "restores pixels"
+            // refs land here once the lane serves file images).
+            if (hostImagePathsOn(ctx.config)) {
+                // Ids seen as screenshot / temp / no-tool-name anywhere (this
+                // request's history, or recorded by an earlier fold) get no path.
+                const rawId = ctx.session.state.messageRefs?.byRef?.[raw];
+                const view = ctx.compressMessages ?? ctx.messages;
+                const m = rawId !== undefined ? view.find((x) => x.id === rawId) : undefined;
+                const env = m !== undefined ? hostImagePathEnv() : undefined;
+                const found = m !== undefined && env !== undefined ? hostImagePathsOfMessage(m, env, hostImageNoPathMap(ctx.session, view, env)) : undefined;
+                if (found !== undefined && found.paths.length > 0) {
+                    noteHostImagePaths(ctx.session, { decompressPaths: 1 });
+                    markDirty(ctx.session);
+                    ctx.log(`[host-image-paths] decompress imageRef ${raw}: ${found.paths.length} path(s), ${found.withoutPath} without`);
+                    return toolFail(hostImageRestoreFailedText(raw, found.paths, found.withoutPath));
+                }
+                noteHostImagePaths(ctx.session, { decompressNoPath: 1 });
+                markDirty(ctx.session);
+            }
+            return toolFail(`[decompress FAILED: no restorable image for ref "${raw}" (it carries no image, is URL- or file-sourced with no bytes stored here — a file-sourced image's original stays with the host and decompress cannot bring it back — or is not in this request's history). Call decompress({ imageRef: "list" }) to see what is available.]`);
+        }
         return toolFail(`[decompress FAILED: no restorable image for ref "${raw}" (it carries no image, is URL-sourced with no stored bytes, or is not in this request's history). Call decompress({ imageRef: "list" }) to see what is available.]`);
     }
     // Files were spilled at index-time, so restoring is a pure lookup: return the

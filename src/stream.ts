@@ -11,7 +11,8 @@ import { ONE_CALL_HINT } from "acp-kernel";
 import { adoptContentStore, contentStoreOf, ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { recordThreadTail } from "./server/thread-tracking.js";
 import { peekStoredTailView } from "./persist.js";
-import { imagePlaceholdersForSummary } from "./image-note.js";
+import { hostHeldFoldNote, imageNoteOptions, imagePlaceholdersForSummary, partitionFoldedImageNotes } from "./image-note.js";
+import { hostImageEntries, hostImageNoPathMap, hostImagePathEnv, hostImagePathsOn, hostImageTaintsOfEntries, noteHostImagePaths, parseHostImagePathNote, rememberHostImageNoPath, renderHostImagePathNote, summaryHasRestorableImages, tallyToDelta, type HostImageEntry } from "./host-image-paths.js";
 import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallEmissionText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 import { compressResult, toolFail, type ProxyToolResult } from "./proxy-tool-result.js";
@@ -484,12 +485,17 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
 // char length plus head/tail excerpts (newlines flattened to spaces) so the
 // model can verify its summary was stored intact without decompressing.
-export function summaryFingerprintLine(blockId: string, summary: string, range?: { startTs: number; endTs: number } | null): string {
+export function summaryFingerprintLine(blockId: string, summary: string, range?: { startTs: number; endTs: number } | null, excerptFrom?: string): string {
     // #1615: code-unit cuts can split a surrogate pair and the lone half
     // breaks upstream JSON parsing of the whole body — clamp + scrub (#816
     // family, third site; never slice model-visible text by hand again).
-    const head = scrubLoneSurrogates(safePrefix(summary, 30).replace(/\r?\n/g, " "));
-    const tail = scrubLoneSurrogates(safeSuffix(summary, 100).replace(/\r?\n/g, " "));
+    // fork (compress.foldHostFileImagePaths): `excerptFrom` = the summary
+    // WITHOUT the mechanical image-path footer (the footer rides the receipt
+    // in full right below, so the tail excerpt must not show half a path).
+    // The reported length stays the full stored summary's. Absent = upstream.
+    const src = excerptFrom ?? summary;
+    const head = scrubLoneSurrogates(safePrefix(src, 30).replace(/\r?\n/g, " "));
+    const tail = scrubLoneSurrogates(safeSuffix(src, 100).replace(/\r?\n/g, " "));
     // #4313: the covered window's local time span, appended deterministically
     // from STORED stamps (state.tsStamps) — never a wall-clock read here.
     const span = range ? ` [${formatTagTime(range.startTs)} – ${formatTagTime(range.endTs)}]` : "";
@@ -1229,19 +1235,90 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // wrapped mass in the net-benefit decision too. Moved above the commit
         // so the gate sees the real post-wrap size (identical arithmetic to the
         // old post-commit honesty note, just evaluated before the state lands).
+        // fork (compress.foldHostFileImagePaths, only together with
+        // foldHostFileImages): blockId → the image-path footer appended below
+        // (the receipt repeats it — #4311 hides a new block's summary while
+        // the compress call is still in context), plus the counts recorded
+        // after the commit. Both stay empty with the switches off.
+        const hostImageFooters = new Map<string, string>();
+        const hostImageDeltas: ReturnType<typeof tallyToDelta>[] = [];
+        // fork: image ids that must never get a path anywhere (screenshot /
+        // temp / no tool name — seen in this request's whole history, in an
+        // earlier fold of this session, or in a footer built below); recorded
+        // into session metadata after the commit so later folds and merges
+        // (where a carried "no path" line has no id) still honour it.
+        let hostImageNoPath: ReturnType<typeof hostImageNoPathMap> | undefined;
         {
             const view = ctx.compressMessages ?? ctx.messages;
             const byRaw = res.state.messageRefs?.byRaw;
+            const pathEnv = hostImagePathsOn(ctx.config) ? hostImagePathEnv() : undefined;
+            const noPath = pathEnv ? hostImageNoPathMap(ctx.session, view, pathEnv) : undefined;
+            if (noPath) hostImageNoPath = new Map(noPath);
             for (const b of res.state.blocks) {
-                if (beforeIds.has(b.blockId)) continue;
+                if (beforeIds.has(b.blockId)) {
+                    // fork: an in-place refold (#398) replaces the summary with the
+                    // model's new text; keep the old block's image-path footer
+                    // (verbatim) so the paths do not vanish with the old summary —
+                    // re-rendered only when one of its paths has since become a
+                    // no-path id.
+                    const prev = beforeSummaries.get(b.blockId);
+                    if (pathEnv && prev !== undefined && prev !== b.summary && parseHostImagePathNote(b.summary, pathEnv) === undefined) {
+                        const old = parseHostImagePathNote(prev, pathEnv);
+                        if (old !== undefined && old.entries.length + old.capped > 0) {
+                            const stale = old.entries.some((e) => e.path !== undefined && e.sha !== undefined && noPath?.has(e.sha) === true);
+                            const text = stale ? renderHostImagePathNote(old, noPath)?.text ?? old.text : old.text;
+                            b.summary = `${b.summary}\n\n${text}`;
+                            hostImageFooters.set(b.blockId, text);
+                        }
+                    }
+                    continue;
+                }
                 const notes: string[] = [];
                 for (const id of b.directMessageIds) {
                     const m = view.find((msg) => msg.id === id);
                     if (!m) continue;
-                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id]));
+                    notes.push(...imagePlaceholdersForSummary(m, byRaw?.[id], imageNoteOptions(ctx.config)));
                 }
-                if (notes.length > 0) {
-                    b.summary = `${b.summary}\n\n[folded images: ${notes.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                // fork: host-held (Anthropic file-sourced) images are NOT restorable —
+                // they get their own plain note, never the "restores pixels" line.
+                const { restorable, hostHeld } = partitionFoldedImageNotes(notes);
+                if (restorable.length > 0) {
+                    b.summary = `${b.summary}\n\n[folded images: ${restorable.join(" ")} — decompress({ imageRef }) restores pixels]`;
+                }
+                if (pathEnv) {
+                    // fork: the image-path footer replaces the plain host-held note —
+                    // consumed child blocks' footers first (carried up, in order),
+                    // then this fold's own tool-result images in view order.
+                    // The footer's first sentence must not contradict the upstream
+                    // "restores pixels" line: `mixed` when this block got that line
+                    // or a consumed child carries one (or a mixed footer).
+                    const carried: HostImageEntry[] = [];
+                    let capped = 0;
+                    let unlisted = 0;
+                    let mixed = restorable.length > 0;
+                    for (const childId of b.directBlockIds) {
+                        const child = beforeSummaries.get(childId);
+                        if (child === undefined) continue;
+                        if (summaryHasRestorableImages(child)) mixed = true;
+                        const sec = parseHostImagePathNote(child, pathEnv);
+                        if (!sec) continue;
+                        carried.push(...sec.entries);
+                        capped += sec.capped;
+                        unlisted += sec.unlisted;
+                    }
+                    const direct = new Set(b.directMessageIds);
+                    const own: HostImageEntry[] = [];
+                    for (const m of view) if (direct.has(m.id)) own.push(...hostImageEntries(m, pathEnv));
+                    const entries = [...carried, ...own];
+                    for (const [sha, why] of hostImageTaintsOfEntries(entries)) hostImageNoPath?.set(sha, hostImageNoPath.get(sha) ?? why);
+                    const note = renderHostImagePathNote({ entries, capped, unlisted, mixed }, noPath);
+                    if (note !== undefined) {
+                        b.summary = `${b.summary}\n\n${note.text}`;
+                        hostImageFooters.set(b.blockId, note.text);
+                        hostImageDeltas.push(tallyToDelta(note.tally, carried.length));
+                    }
+                } else if (hostHeld > 0) {
+                    b.summary = `${b.summary}\n\n${hostHeldFoldNote(hostHeld)}`;
                 }
             }
         }
@@ -1285,6 +1362,16 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             return compressResult(receipt, "refused", 0, "gate:no-net-shrink");
         }
         ctx.session.state = res.state;
+        // fork (compress.foldHostFileImagePaths): count the footers only once
+        // the fold is committed (a refused fold above leaves no trace). Log
+        // line carries numbers only — never a path.
+        if (hostImageDeltas.length > 0) {
+            const sum: Record<string, number> = {};
+            for (const d of hostImageDeltas) for (const [k, v] of Object.entries(d)) sum[k] = (sum[k] ?? 0) + (v ?? 0);
+            noteHostImagePaths(ctx.session, sum);
+            ctx.log(`[host-image-paths] ${hostImageDeltas.length} new block(s): ${Object.entries(sum).map(([k, v]) => `${k}=${v}`).join(" ")}`);
+        }
+        if (hostImageNoPath !== undefined) rememberHostImageNoPath(ctx.session, hostImageNoPath);
         // #2627 backstop: no committed state may carry outbound-only turn-
         // separator ids in coverage (a polluted child would otherwise re-
         // poison higher folds via effectiveMessageIds inheritance). Runs
@@ -1568,7 +1655,14 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const messageTimestampsOn = resolveMessageTimestamps(loadConfigFile().compress);
         const subagentMap = subagentSessionsOf(ctx.session);
         for (const b of changedBlocks) {
-            msg += `\n${summaryFingerprintLine(b.blockId, b.summary, messageTimestampsOn ? blockCoverageTimes(b, res.state) : null)}`;
+            // fork (compress.foldHostFileImagePaths): the footer rides the
+            // receipt in full under the fingerprint, and the fingerprint's
+            // excerpts come from the summary WITHOUT it. The log copy gets
+            // neither (no excerpts, no paths — #1718).
+            const footer = hostImageFooters.get(b.blockId);
+            const excerptFrom = footer !== undefined && b.summary.endsWith(`\n\n${footer}`) ? b.summary.slice(0, b.summary.length - footer.length - 2) : undefined;
+            msg += `\n${summaryFingerprintLine(b.blockId, b.summary, messageTimestampsOn ? blockCoverageTimes(b, res.state) : null, excerptFrom)}`;
+            if (excerptFrom !== undefined) msg += `\n${footer}`;
             logMsg += `\n${summaryFingerprintLogLine(b.blockId, b.summary)}`;
             const ids = subagentMap[b.blockId];
             if (ids !== undefined && ids.length > 0) {

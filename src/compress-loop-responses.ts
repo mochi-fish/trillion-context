@@ -16,6 +16,7 @@ import { type ResponseInputItem } from "acp-kernel/wire";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
+import { noteFishEgress } from "./cache-ledger.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
 
@@ -215,6 +216,8 @@ export async function compressLoopResponsesJson(
         requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
         const roundBody = JSON.stringify(requestOptions.wireTransform ? requestOptions.wireTransform(requestBody) : requestBody);
         requestOptions.resign?.(requestOptions.headers, roundBody);
+        // fish-ledger P0 (egress, lane loop): the Responses compress loop's round.
+        noteFishEgress({ lane: "loop", body: roundBody, upstreamUrl: requestOptions.url, model: typeof requestBody.model === "string" ? requestBody.model : undefined, sid: ctx.session.id });
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,

@@ -31,6 +31,31 @@ interface ImageRef {
     // records type + size so the fold does not lose it silently; there is no
     // decompress({ imageRef }) restore for these.
     label?: string;
+    // fork: an Anthropic {type:"file"} source nested in a tool_result, seen
+    // with compress.foldHostFileImages on — the HOST holds the original
+    // (provider Files API id, re-uploaded by the host before it expires). No
+    // bytes here, no durable handle: the placeholder says so and carries no
+    // decompress ref (decompress cannot bring it back). With the switch off
+    // (default) this is never set and every placeholder stays upstream's.
+    hostHeld?: true;
+}
+
+/** fork: per-call options for the image notes. Absent / hostFileImages unset
+ *  = upstream behavior byte for byte (a file-sourced image renders as the
+ *  codec's `[image]` / an opaque `[media: …]` label, exactly as before). */
+interface ImageNoteOptions {
+    /** compress.foldHostFileImages — tool_result file images get the
+     *  host-held placeholder (no ref suffix, never "restores pixels"). */
+    hostFileImages?: boolean;
+}
+
+/** fork: the image-note options a resolved Config implies. */
+export function imageNoteOptions(config: unknown): ImageNoteOptions | undefined {
+    return (config as { foldHostFileImages?: unknown } | undefined)?.foldHostFileImages === true ? { hostFileImages: true } : undefined;
+}
+
+function isFileSource(s: unknown): boolean {
+    return isObj(s) && s.type === "file" && typeof s.file_id === "string" && s.file_id.length > 0;
 }
 
 function refFromDataUrl(url: unknown): ImageRef | undefined {
@@ -47,7 +72,7 @@ function opaqueLabel(part: Record<string, unknown>): string {
 
 /** The images this core message carries, in wire order. Empty for plain-text
  *  messages (the common case — this is called per message per chunk). */
-export function messageImages(m: CoreMessage): ImageRef[] {
+export function messageImages(m: CoreMessage, opts?: ImageNoteOptions): ImageRef[] {
     const mm = m as BiliMessage;
     // Anthropic: each image block becomes its own core message; the same
     // sidecar field also carries structured tool_results, so gate on type.
@@ -61,6 +86,9 @@ export function messageImages(m: CoreMessage): ImageRef[] {
         if (isObj(s) && s.type === "url") {
             return [refFromDataUrl(s.url) ?? { mediaType }];
         }
+        // fork: a TOP-LEVEL file image stays pinned even with the switch on
+        // (its identity is positional — see kernel protected.ts), so it never
+        // folds and keeps the upstream placeholder.
         return [{ mediaType }];
     }
     // #3398: tool_result blocks with non-text nested blocks ride the same
@@ -75,6 +103,8 @@ export function messageImages(m: CoreMessage): ImageRef[] {
                 refs.push({ mediaType: isObj(s) && typeof s.media_type === "string" ? s.media_type : undefined, b64: s.data });
             } else if (isObj(s) && s.type === "url") {
                 refs.push(refFromDataUrl(s.url) ?? {});
+            } else if (opts?.hostFileImages === true && c.type === "image" && isFileSource(s)) {
+                refs.push({ mediaType: isObj(s) && typeof s.media_type === "string" ? s.media_type : undefined, hostHeld: true });
             } else {
                 refs.push({ label: opaqueLabel(c) });
             }
@@ -124,11 +154,13 @@ export function messageImages(m: CoreMessage): ImageRef[] {
 /** One placeholder per carried image: `[image: png 1024x768]`, degrading to
  *  `[image: png]` / `[image]` as detail becomes unavailable. Dimensions come
  *  from decodeImageDims (container-header scan only — no full decode). */
-export function imagePlaceholders(m: CoreMessage): string[] {
-    return messageImages(m).map((ref) => {
+export function imagePlaceholders(m: CoreMessage, opts?: ImageNoteOptions): string[] {
+    return messageImages(m, opts).map((ref) => {
         // #3398: opaque payloads have no pixels to describe — a distinct
         // `[media: …]` marker so readers don't mistake them for restorable images.
         if (ref.label && !ref.b64) return `[media: ${ref.label}]`;
+        // fork: host-held file image — no pixels here, never a re-access handle.
+        if (ref.hostHeld) return HOST_HELD_IMAGE_PLACEHOLDER;
         let note = "";
         if (ref.mediaType) note += ref.mediaType.includes("/") ? ref.mediaType.split("/").pop()! : ref.mediaType;
         if (ref.b64) {
@@ -146,8 +178,37 @@ export function imagePlaceholders(m: CoreMessage): string[] {
  *  `decompress({ imageRef: "m00042" })` can pull the pixels back (the
  *  #2022 restore channel indexes by exactly this ref). `ref` undefined →
  *  plain placeholders (callers without a ref mapping degrade gracefully). */
-export function imagePlaceholdersForSummary(m: CoreMessage, ref: string | undefined): string[] {
-    const notes = imagePlaceholders(m);
+export function imagePlaceholdersForSummary(m: CoreMessage, ref: string | undefined, opts?: ImageNoteOptions): string[] {
+    const notes = imagePlaceholders(m, opts);
     if (ref === undefined) return notes;
-    return notes.map((n) => `${n.slice(0, -1)} · ${ref}]`);
+    // fork: a host-held image is NOT restorable by decompress({ imageRef }), so
+    // it never gets the ref suffix that would advertise a restore channel.
+    return notes.map((n) => (n === HOST_HELD_IMAGE_PLACEHOLDER ? n : `${n.slice(0, -1)} · ${ref}]`));
+}
+
+/** fork: the placeholder for an Anthropic {type:"file"} image in a tool
+ *  result (summary input, external-summary context, the egress gate). Plain
+ *  words, no file id, no restore promise — and NEUTRAL: these places also see
+ *  images that were never folded, so "已折起" lives only in the fold footer
+ *  below (hostHeldFoldNote). */
+export const HOST_HELD_IMAGE_PLACEHOLDER = "[图片（原图在宿主那边）]";
+
+/** fork: the mechanical footer a new block gets when it folded host-held
+ *  images. Deliberately no file id and no restore promise — the pixels are
+ *  not kept here; the original stays with the host. */
+export function hostHeldFoldNote(count: number): string {
+    return `[这一段里有 ${count} 张图，已折起：像素不在这里，decompress 拿不回图，原图在宿主那边]`;
+}
+
+/** fork: split a message's summary placeholders into the restorable kind
+ *  (bytes archived here — decompress({ imageRef }) brings them back) and the
+ *  host-held kind (pixels gone from the view, original stays with the host). */
+export function partitionFoldedImageNotes(notes: readonly string[]): { restorable: string[]; hostHeld: number } {
+    const restorable: string[] = [];
+    let hostHeld = 0;
+    for (const n of notes) {
+        if (n === HOST_HELD_IMAGE_PLACEHOLDER) hostHeld++;
+        else restorable.push(n);
+    }
+    return { restorable, hostHeld };
 }

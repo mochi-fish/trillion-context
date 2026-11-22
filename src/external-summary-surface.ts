@@ -2,6 +2,7 @@ import { FUNCTION_ACP_TAGS_TIMESTAMPED, LEAN_HOW_TO_COMPRESS, LEAN_HOW_TO_COMPRE
 import type { ResolvedKernelConfig } from "./compress-settings.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 import { loadConfigFile, resolveMessageTimestamps } from "./config.js";
+import { noGhostwriteOn } from "./no-ghostwrite.js";
 
 export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversation model selects consumed ranges; the configured independent summary service generates the authoritative summary. Pass ONE 'content' string JSON-encoding an array of {startId, endId, topic?} objects (the string parameter accepts a JSON-encoded array; do not send a raw JSON array argument). summary is optional and, if supplied, only a non-authoritative hint, not the committed summary. Selected source text and read-only context are sent to the configured service using its separate credentials. All candidates failing leaves originals unchanged. This mode overrides instructions above requiring you to write the final summary.]";
 
@@ -11,7 +12,10 @@ export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversati
  *  ResolvedKernelConfig rail from resolveRequestConfig → storeEffectiveConfig,
  *  so no consumer re-reads the config file. */
 export function externalSummaryEnabled(config: unknown): boolean {
-    return (config as ResolvedKernelConfig | undefined)?.externalSummary?.enabled === true;
+    // fork: no-ghostwrite turns the whole external-summary mode off for the
+    // request — the conversation model is told to write its own summaries
+    // again (tool schema, prompt notes) and nothing summarizes on its behalf.
+    return (config as ResolvedKernelConfig | undefined)?.externalSummary?.enabled === true && !noGhostwriteOn(config);
 }
 
 /** #4460: section overrides for the CONVERSATION-side compress prompt. In
@@ -108,6 +112,15 @@ export function externalQueueDroppedAll(dispatch: { calls: number; attempts: num
 /** Nudge suppression + growth trigger share this gate: auto-fold is only
  *  "engaged" while the chain is on AND not in backoff. */
 export function autoFoldEngaged(config: unknown, session: { metadata?: Record<string, unknown> } | undefined): boolean {
+    // fork: no-ghostwrite disengages auto-fold — classic nudges come back and
+    // the growth trigger never arms (server.ts counts what it would have done).
+    return autoFoldWanted(config, session) && !noGhostwriteOn(config);
+}
+
+/** fork: the pre-no-ghostwrite engagement test (chain on, not in backoff).
+ *  Only server.ts's preflight reads it, to count the growth folds the
+ *  no-ghostwrite switch suppressed. */
+export function autoFoldWanted(config: unknown, session: { metadata?: Record<string, unknown> } | undefined): boolean {
     return autoFoldActive(config) && !autoFoldBackoffActive(session);
 }
 
@@ -127,6 +140,7 @@ export function autoFoldEngaged(config: unknown, session: { metadata?: Record<st
  *  and suppression must release (classic nudges are the remaining channel).
  *  Mirrors the target math in server.ts's preflight — keep the two in sync. */
 export function growthFoldingArmed(config: unknown, overflowTarget?: number, measuredFloor?: number): boolean {
+    if (noGhostwriteOn(config)) return false;
     const resolved = config as ResolvedKernelConfig | undefined;
     const ext = resolved?.externalSummary;
     if (ext?.enabled !== true || ext.autoFold !== true) return false;

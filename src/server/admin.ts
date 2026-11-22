@@ -42,10 +42,13 @@ import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
+import { searchV2AroundOn } from "../search-cjk/settings.js";
 import { FAVICON_ICO_BASE64 } from "../web/favicon.js";
 import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
+import { fishLedgerHealth, setFishLedgerRecordEstimate } from "../fish-ledger.js";
+import { fishDateNotesHealthField, setFishDateNotes } from "../fish/date-notes.js";
 
 interface AdminCtx {
     opts: ProxyOptions;
@@ -306,7 +309,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
         const aux = auxProxyShot(opts);
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] }, fishLedger: fishLedgerHealth(), ...fishDateNotesHealthField() }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -423,6 +426,14 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            // fork（多模型，M6）：保存也和 reload 一样换 recordEstimate（F8）。
+            if (fresh.fishLedger !== undefined) opts.fishLedger = fresh.fishLedger;
+            else delete opts.fishLedger;
+            setFishLedgerRecordEstimate(opts.fishLedger?.recordEstimate === true);
+            // fork（日期）：fish.dateNotes 跟着保存换
+            if (fresh.fish !== undefined) opts.fish = fresh.fish;
+            else delete opts.fish;
+            setFishDateNotes(opts.fish?.dateNotes);
             // #5079: routing must hot-apply too — the web switch changes it live.
             opts.promptCache = fresh.promptCache;
             resetProxyCache();
@@ -519,7 +530,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // tool descriptions follow the top-level promptPack while per-request system prompts
         // may still honor deeper provider/model levels.
         const packSurface = resolveCompressSurfaceDetailed(opts.compress ?? {});
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts, searchV2AroundOn(opts.compress?.search));
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -798,7 +809,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
-            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true });
+            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true, ...(searchV2AroundOn(opts.compress?.search) ? { searchLane: { around: true, raw: opts.compress.search } } : {}) });
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
@@ -927,6 +938,15 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     opts.compat = reloaded.compat;
     opts.imageBilling = reloaded.imageBilling;
     opts.imageTokenCap = reloaded.imageTokenCap;
+    // fork（多模型，M6）：证据账的 recordEstimate 跟着 reload（handle 每份请求现读 opts.fishLedger）。
+    if (reloaded.fishLedger !== undefined) opts.fishLedger = reloaded.fishLedger;
+    else delete opts.fishLedger;
+    // rows written before the next request already use the new value (F8)
+    setFishLedgerRecordEstimate(opts.fishLedger?.recordEstimate === true);
+    // fork（日期）：fish.dateNotes 跟着 reload 换（工具结果下一次调用就按新的走）
+    if (reloaded.fish !== undefined) opts.fish = reloaded.fish;
+    else delete opts.fish;
+    setFishDateNotes(opts.fish?.dateNotes);
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().

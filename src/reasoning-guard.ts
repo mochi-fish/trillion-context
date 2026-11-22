@@ -1,4 +1,5 @@
 import { fetchWithTimeout } from "./fetch-util.js";
+import { noteFishEgress } from "./cache-ledger.js";
 import { scrubLoneSurrogatesOnWire } from "./text-safe.js";
 import { normalizeSseLineEndings, finalizeSseLineEndings } from "./sse-util.js";
 import { awaitDrain } from "./server/stream-io.js";
@@ -547,6 +548,8 @@ export async function runReasoningGuard(p: GuardParams): Promise<void> {
             const roundBodyStr = scrubLoneSurrogatesOnWire(JSON.stringify(nextBody));
             let roundRes: Awaited<ReturnType<typeof fetchWithTimeout>>;
             p.resign?.(p.reqHeaders, roundBodyStr);
+            // fish-ledger P0: a continuation round inside the same request.
+            noteFishEgress({ lane: "resend", reason: "reasoning-guard", body: roundBodyStr, upstreamUrl: p.upstreamUrl });
             try {
                 roundRes = await fetchWithTimeout(p.upstreamUrl, {
                     method: "POST",
