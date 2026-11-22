@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 392" width="920" height="392" role="img" aria-label="trillion-context 从代码压缩走向长期陪伴上下文管理">
+  <defs>
+    <marker id="tc-main" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#2A78D6"/>
+    </marker>
+  </defs>
+
+  <!-- Outer Card (baka.studio palette) -->
+  <rect x="4" y="4" width="912" height="384" rx="14" fill="#F2F6F7" stroke="#D3DCE0" stroke-width="1.5"/>
+
+  <!-- Top Positioning Contrast Banner -->
+  <text x="32" y="35" font-family="'Noto Serif SC', 'Songti SC', 'PingFang SC', 'Microsoft YaHei', serif" font-size="16" font-weight="700" fill="#0E1C24">trillion-context · 从「代码任务压缩」到「长期陪伴上下文管理」</text>
+  <line x1="32" y1="48" x2="888" y2="48" stroke="#D3DCE0" stroke-width="1"/>
+
+  <!-- Top Compare Strip -->
+  <rect x="32" y="60" width="414" height="50" rx="8" fill="#E9EFF1" stroke="#A9B7BE" stroke-width="1"/>
+  <text x="48" y="80" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="12" font-weight="700" fill="#3F4F59">原版 billion-context（面向代码与工程任务）</text>
+  <text x="48" y="98" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#62717A">工单结项即翻篇 · 允许旁路模型代写摘要 · 偏重代码标识符子串检索</text>
+
+  <rect x="466" y="60" width="422" height="50" rx="8" fill="#E4EEFB" stroke="#2A78D6" stroke-width="1.5"/>
+  <text x="482" y="80" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="12" font-weight="700" fill="#0E1C24">trillion-context（面向终身单会话陪伴体）</text>
+  <text x="482" y="98" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#2A78D6" font-weight="600">一条连续生活史 · 摘要只由她亲手写 · 中文口语、约定与相对日期精准召回</text>
+
+  <!-- 4 Pipeline Pillars -->
+  <!-- Pillar 1: Water Level (W) -->
+  <rect x="32" y="126" width="198" height="190" rx="10" fill="#FCFDFD" stroke="#2A78D6" stroke-width="1.5"/>
+  <rect x="32" y="126" width="198" height="36" rx="10" fill="#E4EEFB"/>
+  <rect x="32" y="150" width="198" height="12" fill="#E4EEFB"/>
+  <text x="46" y="149" font-family="'Noto Serif SC', 'PingFang SC', 'Microsoft YaHei', serif" font-size="13.5" font-weight="700" fill="#0E1C24">1. 水位与不代写</text>
+  <rect x="192" y="135" width="26" height="18" rx="4" fill="#FCFDFD" stroke="#2A78D6" stroke-width="1"/>
+  <text x="205" y="148" text-anchor="middle" font-family="'JetBrains Mono', Consolas, monospace" font-size="10" font-weight="600" fill="#2A78D6">W</text>
+
+  <text x="46" y="182" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="600" fill="#0E1C24">• 越线只催她自折，绝不代笔</text>
+  <text x="54" y="199" font-family="'JetBrains Mono', Consolas, monospace" font-size="10.5" fill="#2A78D6">noGhostwrite: true</text>
+  <text x="46" y="222" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 紧急截断只认真实用量读数</text>
+  <text x="46" y="244" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 保护末尾最新身份系统提示</text>
+  <text x="46" y="266" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 宿主机文件图可折并留路径</text>
+  <text x="46" y="294" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#62717A">配中文规则包 fish-pack-zh</text>
+
+  <line x1="230" y1="221" x2="250" y2="221" stroke="#2A78D6" stroke-width="1.8" marker-end="url(#tc-main)"/>
+
+  <!-- Pillar 2: CJK Recall & Relative Date (G2) -->
+  <rect x="256" y="126" width="198" height="190" rx="10" fill="#FCFDFD" stroke="#2A78D6" stroke-width="1.5"/>
+  <rect x="256" y="126" width="198" height="36" rx="10" fill="#E4EEFB"/>
+  <rect x="256" y="150" width="198" height="12" fill="#E4EEFB"/>
+  <text x="270" y="149" font-family="'Noto Serif SC', 'PingFang SC', 'Microsoft YaHei', serif" font-size="13.5" font-weight="700" fill="#0E1C24">2. 原话与日期召回</text>
+  <rect x="410" y="135" width="32" height="18" rx="4" fill="#FCFDFD" stroke="#2A78D6" stroke-width="1"/>
+  <text x="426" y="148" text-anchor="middle" font-family="'JetBrains Mono', Consolas, monospace" font-size="10" font-weight="600" fill="#2A78D6">G2</text>
+
+  <text x="270" y="182" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="600" fill="#0E1C24">• 中文单字+双字 BM25 检索</text>
+  <text x="278" y="199" font-family="'JetBrains Mono', Consolas, monospace" font-size="10.5" fill="#2A78D6">engine:"cjk" · around</text>
+  <text x="270" y="222" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 剥信封抬头 + 重叠滑窗摘录</text>
+  <text x="270" y="244" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 约定追问双向人称翻转检索</text>
+  <text x="270" y="266" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 翻旧话内联标相对公历括号</text>
+  <text x="270" y="294" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#62717A">执行期附注，不改原文与缓存 ID</text>
+
+  <line x1="454" y1="221" x2="474" y2="221" stroke="#2A78D6" stroke-width="1.8" marker-end="url(#tc-main)"/>
+
+  <!-- Pillar 3: Multi-Model Contract -->
+  <rect x="480" y="126" width="194" height="190" rx="10" fill="#FCFDFD" stroke="#EB6834" stroke-width="1.5"/>
+  <rect x="480" y="126" width="194" height="36" rx="10" fill="#FDEAE1"/>
+  <rect x="480" y="150" width="194" height="12" fill="#FDEAE1"/>
+  <text x="494" y="149" font-family="'Noto Serif SC', 'PingFang SC', 'Microsoft YaHei', serif" font-size="13.5" font-weight="700" fill="#0E1C24">3. 多模型切换护栏</text>
+  <rect x="630" y="135" width="32" height="18" rx="4" fill="#FCFDFD" stroke="#EB6834" stroke-width="1"/>
+  <text x="646" y="148" text-anchor="middle" font-family="'JetBrains Mono', Consolas, monospace" font-size="10" font-weight="600" fill="#C94E1E">G2</text>
+
+  <text x="494" y="182" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="600" fill="#0E1C24">• 按模型输入预算独立判窗</text>
+  <text x="502" y="199" font-family="'JetBrains Mono', Consolas, monospace" font-size="10.5" fill="#C94E1E">limitMode: "input"</text>
+  <text x="494" y="222" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 换模后冷却期缓截保 98% 前缀</text>
+  <text x="494" y="244" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 思考签名 400 自动剥离重试</text>
+  <text x="494" y="266" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 保留 reasoning 适配本地 vLLM</text>
+  <text x="494" y="294" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#62717A">云端与自建推理平滑往返</text>
+
+  <line x1="674" y1="221" x2="694" y2="221" stroke="#2A78D6" stroke-width="1.8" marker-end="url(#tc-main)"/>
+
+  <!-- Pillar 4: Ledger & Audience -->
+  <rect x="700" y="126" width="188" height="190" rx="10" fill="#FCFDFD" stroke="#1BAF7A" stroke-width="1.5"/>
+  <rect x="700" y="126" width="188" height="36" rx="10" fill="#E0F4EC"/>
+  <rect x="700" y="150" width="188" height="12" fill="#E0F4EC"/>
+  <text x="714" y="149" font-family="'Noto Serif SC', 'PingFang SC', 'Microsoft YaHei', serif" font-size="13.5" font-weight="700" fill="#0E1C24">4. 证据账与受众链</text>
+  <rect x="844" y="135" width="32" height="18" rx="4" fill="#FCFDFD" stroke="#1BAF7A" stroke-width="1"/>
+  <text x="860" y="148" text-anchor="middle" font-family="'JetBrains Mono', Consolas, monospace" font-size="10" font-weight="600" fill="#138A5F">P0+</text>
+
+  <text x="714" y="182" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" font-weight="600" fill="#0E1C24">• 出口记请求清单哈希对账</text>
+  <text x="722" y="199" font-family="'JetBrains Mono', Consolas, monospace" font-size="10.5" fill="#138A5F">fishLedger: true</text>
+  <text x="714" y="222" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 真实与估算用量双轨记录</text>
+  <text x="714" y="244" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 原文账本充当只读原话层</text>
+  <text x="714" y="266" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#3F4F59">• 预留按受众分链与换册父链</text>
+  <text x="714" y="294" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11" fill="#138A5F">零对话正文落入外部证据账</text>
+
+  <!-- Bottom Byte-Identical Guarantee -->
+  <rect x="32" y="330" width="856" height="44" rx="9" fill="#0E1C24"/>
+  <text x="50" y="357" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="12" font-weight="700" fill="#7DD3FC">零侵入承诺：</text>
+  <text x="128" y="357" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif" font-size="11.5" fill="#E9EFF2">所有新增能力均为缺省关闭开关；全缺省时经 E0-wire / E0-golden 门禁核验，出站字节流与检索结果和上游基线逐字节一致。</text>
+</svg>
